@@ -52,11 +52,11 @@ def fetch_ncaa_markets(api_key):
     all_markets = []
     seen_tickers = set()
 
-    # --- Strategy 1: fetch by confirmed series ticker KXNCAAMB first ---
+    # --- Strategy 1: fetch by confirmed series ticker KXNCAAMBGAME first ---
     CANDIDATE_SERIES = [
-        "KXNCAAMB",  # confirmed March Madness ticker
-        "KXNCAAB", "KXMARCHMADNESS", "KXCBB", "KXNCAATOURNEY",
-        "KXNCAAT", "KXMM26", "KXNCAAB26",
+        "KXNCAAMBGAME",  # confirmed series ticker from URL
+        "KXNCAAMB", "KXNCAAB", "KXMARCHMADNESS", "KXCBB",
+        
     ]
     for series in CANDIDATE_SERIES:
         try:
@@ -77,6 +77,27 @@ def fetch_ncaa_markets(api_key):
     # If we found markets from series, return early — no need to paginate
     if all_markets:
         return all_markets
+
+    # --- Strategy 1b: fetch today's games directly by event ticker pattern ---
+    # Pattern confirmed: KXNCAAMBGAME-26MAR19HOWMICH (away+home 3-letter codes)
+    # Try fetching the parent series events list
+    try:
+        r = requests.get(
+            f"{BASE_URL}/events",
+            params={"series_ticker": "KXNCAAMBGAME", "status": "open", "limit": 200, "with_nested_markets": "true"},
+            headers=kalshi_headers(api_key),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            for event in r.json().get("events", []):
+                for m in event.get("markets", []):
+                    if m["ticker"] not in seen_tickers:
+                        seen_tickers.add(m["ticker"])
+                        all_markets.append(m)
+        if all_markets:
+            return all_markets
+    except Exception:
+        pass
 
     # --- Strategy 2: paginate through open sports events, keyword filter ---
     cursor = None
