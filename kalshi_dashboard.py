@@ -46,16 +46,42 @@ def fetch_ncaa_markets(api_key):
     2. Filtering by NCAA/basketball/March Madness keywords in title
     3. Collecting all nested markets from matching events
     """
-    NCAA_KEYWORDS = ["ncaa", "march madness", "basketball", "ncaab", "college basketball",
-                     "tournament", "duke", "arizona", "florida", "michigan", "houston"]
+    NCAA_KEYWORDS = ["ncaa", "march madness", "basketball", "ncaab", "ncaamb",
+                     "college basketball", "tournament", "kxncaamb"]
     
     all_markets = []
     seen_tickers = set()
 
-    # --- Strategy 1: paginate through open sports events ---
+    # --- Strategy 1: fetch by confirmed series ticker KXNCAAMB first ---
+    CANDIDATE_SERIES = [
+        "KXNCAAMB",  # confirmed March Madness ticker
+        "KXNCAAB", "KXMARCHMADNESS", "KXCBB", "KXNCAATOURNEY",
+        "KXNCAAT", "KXMM26", "KXNCAAB26",
+    ]
+    for series in CANDIDATE_SERIES:
+        try:
+            r = requests.get(
+                f"{BASE_URL}/markets",
+                params={"series_ticker": series, "status": "open", "limit": 200},
+                headers=kalshi_headers(api_key),
+                timeout=8,
+            )
+            if r.status_code == 200:
+                for m in r.json().get("markets", []):
+                    if m["ticker"] not in seen_tickers:
+                        seen_tickers.add(m["ticker"])
+                        all_markets.append(m)
+        except Exception:
+            pass
+
+    # If we found markets from series, return early — no need to paginate
+    if all_markets:
+        return all_markets
+
+    # --- Strategy 2: paginate through open sports events, keyword filter ---
     cursor = None
     pages = 0
-    while pages < 10:  # safety cap
+    while pages < 10:
         params = {
             "status": "open",
             "limit": 200,
@@ -75,7 +101,7 @@ def fetch_ncaa_markets(api_key):
             data = r.json()
             events = data.get("events", [])
             for event in events:
-                title = (event.get("title", "") + " " + event.get("sub_title", "")).lower()
+                title = (event.get("title", "") + " " + event.get("sub_title", "") + " " + event.get("series_ticker", "")).lower()
                 if any(kw in title for kw in NCAA_KEYWORDS):
                     for m in event.get("markets", []):
                         if m["ticker"] not in seen_tickers:
@@ -87,27 +113,6 @@ def fetch_ncaa_markets(api_key):
             pages += 1
         except Exception:
             break
-
-    # --- Strategy 2: directly try known KX-style NCAA series tickers ---
-    CANDIDATE_SERIES = [
-        "KXNCAAB", "KXMARCHMADNESS", "KXCBB", "KXNCAATOURNEY",
-        "KXNCAAT", "KXMM26", "KXNCAAB26",
-    ]
-    for series in CANDIDATE_SERIES:
-        try:
-            r = requests.get(
-                f"{BASE_URL}/markets",
-                params={"series_ticker": series, "status": "open", "limit": 200},
-                headers=kalshi_headers(api_key),
-                timeout=8,
-            )
-            if r.status_code == 200:
-                for m in r.json().get("markets", []):
-                    if m["ticker"] not in seen_tickers:
-                        seen_tickers.add(m["ticker"])
-                        all_markets.append(m)
-        except Exception:
-            pass
 
     # --- Strategy 3: broad open markets scan, keyword filter ---
     if not all_markets:
