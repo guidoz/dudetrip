@@ -1,2 +1,2 @@
-# boystrip
+# dudetrip
 John's Vegas adventure
