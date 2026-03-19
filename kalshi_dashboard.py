@@ -359,156 +359,155 @@ if not markets:
                 st.error(f"Could not find ticker: {manual_ticker}")
 
 if markets:
-    # Group markets by event_ticker — each game has multiple markets (YES team A, YES team B, spread, total)
-    # We want one row per GAME not one row per contract
     from collections import defaultdict
+
+    # ── Group by game ────────────────────────────────────────────────────────
     games = defaultdict(list)
     for m in markets:
         event = m.get("event_ticker", m.get("ticker", ""))
         games[event].append(m)
 
-    st.success(f"Found **{len(games)}** games · **{len(markets)}** markets on Kalshi")
-
-    # Build one row per game
-    rows = []
-    for event_ticker, game_markets in sorted(games.items()):
-        # Sort markets by yes_bid descending so the favorite comes first
-        game_markets.sort(key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True)
-
-        if len(game_markets) >= 2:
-            fav = game_markets[0]
-            dog = game_markets[1]
-            fav_name = fav.get("yes_sub_title") or fav.get("subtitle") or fav.get("ticker", "").split("-")[-1]
-            dog_name = dog.get("yes_sub_title") or dog.get("subtitle") or dog.get("ticker", "").split("-")[-1]
-            # Fall back to title if subtitles are same
-            if fav_name == dog_name:
-                fav_name = fav.get("ticker", "").split("-")[-1]
-                dog_name = dog.get("ticker", "").split("-")[-1]
-            fav_m = compute_spread_metrics(fav)
-            dog_m = compute_spread_metrics(dog)
-            fav_vol = float(fav.get("volume_fp", 0) or 0)
-            dog_vol = float(dog.get("volume_fp", 0) or 0)
-            total_vol = fav_vol + dog_vol
-            spread = fav_m.get("spread")
-            signal = edge_signal(fav_m.get("mid", 0), spread, total_vol)
-            # Derive game title from the shared market title (strip "Winner?" etc)
-            game_title = fav.get("title", event_ticker)
-            game_title = game_title.replace(" Winner?", "").replace(" winner?", "").strip()
-            rows.append({
-                "Game": game_title,
-                "Favorite": fav_name,
-                "Fav Mid ¢": f"{fav_m.get('mid', 0):.1f}",
-                "Fav Spread ¢": f"{spread:.1f}" if spread is not None else "—",
-                "Underdog": dog_name,
-                "Dog Mid ¢": f"{dog_m.get('mid', 0):.1f}",
-                "Total Vol": f"{total_vol:,.0f}",
-                "Signal": signal,
-                "_event": event_ticker,
-            })
+    # ── Build enriched game objects ──────────────────────────────────────────
+    def implied_american(prob):
+        """Convert 0-100 prob to American odds string."""
+        if prob <= 0 or prob >= 100:
+            return "N/A"
+        if prob >= 50:
+            return f"-{int(round(prob / (100 - prob) * 100))}"
         else:
-            # Single market (total, spread line, etc) — show as-is
-            m = game_markets[0]
-            metrics = compute_spread_metrics(m)
-            volume = float(m.get("volume_fp", 0) or 0)
-            rows.append({
-                "Game": m.get("title", event_ticker)[:55],
-                "Favorite": "—",
-                "Fav Mid ¢": f"{metrics.get('mid', 0):.1f}",
-                "Fav Spread ¢": f"{metrics.get('spread', 0):.1f}" if metrics.get('spread') is not None else "—",
-                "Underdog": "—",
-                "Dog Mid ¢": "—",
-                "Total Vol": f"{volume:,.0f}",
-                "Signal": edge_signal(metrics.get("mid", 0), metrics.get("spread"), volume),
-                "_event": event_ticker,
-            })
+            return f"+{int(round((100 - prob) / prob * 100))}"
 
-    df = pd.DataFrame(rows)
-    display_df = df.drop(columns=["_event"])
-
-    # Highlight sharp markets
-    sharp = display_df[display_df["Signal"] == "🟢 Sharp market"]
-    if not sharp.empty:
-        st.subheader("🟢 Sharp Markets — Tight Spreads, High Volume")
-        st.dataframe(sharp, use_container_width=True, hide_index=True)
-
-    st.subheader("📊 Today's Games")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-    # ── Order book deep dive ──────────────────────────────────────────────────
-
-    if show_orderbook and markets:
-        st.divider()
-        st.subheader("📖 Order Book Deep Dive")
+    def bet_verdict(fav_mid, dog_mid, spread, vol, fav_book_ml, dog_book_ml):
+        """
+        Core logic: compare Kalshi mid (true prob) to BetMGM/El Cortez implied prob.
+        Returns (verdict_str, color, detail_str)
         
-        # Build friendly label: "Game — Team" using subtitle for the team name
-        def market_label(m):
-            game = m.get("title", "").replace(" Winner?", "").strip()
-            team = m.get("yes_sub_title") or m.get("subtitle") or m.get("ticker","").split("-")[-1]
-            return f"{game} — {team}"
+        Without live book data we use Kalshi itself as the signal:
+        - Tight spread + high volume = market is sharp = trust the mid
+        - Big discrepancy between fav_mid + dog_mid and 100 = vig is wide = book edge
+        - If fav_mid > 80: heavy chalk, low value
+        - If dog_mid between 25-45: underdog has real value zone
+        """
+        if spread is None or vol < 100:
+            return "⚪ NO DATA", "#555", "Insufficient liquidity to signal"
 
-        tickers = [m["ticker"] for m in markets]
-        ticker_labels = {m["ticker"]: market_label(m) for m in markets}
-        selected = st.selectbox("Select a team/market", tickers,
-                                format_func=lambda t: ticker_labels.get(t, t))
+        total = fav_mid + dog_mid
+        vig_pct = total - 100  # how much the market is taking
 
-        ob = fetch_orderbook(api_key, selected)
-        detail = fetch_market_detail(api_key, selected)
-        metrics = compute_spread_metrics(detail) if detail else {}
-
-        if ob or detail:
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Yes Bid", f"{metrics.get('yes_bid', '—'):.1f}¢")
-            col2.metric("Yes Ask", f"{metrics.get('yes_ask', '—'):.1f}¢")
-            col3.metric("Mid Price", f"{metrics.get('mid', '—'):.1f}¢",
-                        help="Implied win probability")
-            col4.metric("Spread", 
-                        f"{metrics.get('spread', '—'):.1f}¢" if metrics.get('spread') is not None else "—",
-                        delta=f"Vig: {metrics.get('total_vig', '—'):.1f}¢" if metrics.get('total_vig') is not None else None,
-                        delta_color="inverse")
-
-            yes_bids = ob.get("yes_dollars", [])
-            no_bids  = ob.get("no_dollars", [])
-
-            col_yes, col_no = st.columns(2)
-
-            with col_yes:
-                st.markdown("**YES Bids** (buyers)")
-                if yes_bids:
-                    yes_df = pd.DataFrame(yes_bids, columns=["Price ($)", "Size"])
-                    yes_df["Price ($)"] = yes_df["Price ($)"].astype(float)
-                    yes_df["Size"] = yes_df["Size"].astype(float)
-                    yes_df["Implied %"] = (yes_df["Price ($)"] * 100).round(1)
-                    st.dataframe(yes_df.head(10), use_container_width=True, hide_index=True)
-                else:
-                    st.info("No yes bids available")
-
-            with col_no:
-                st.markdown("**NO Bids** (= YES asks inverted)")
-                if no_bids:
-                    no_df = pd.DataFrame(no_bids, columns=["Price ($)", "Size"])
-                    no_df["Price ($)"] = no_df["Price ($)"].astype(float)
-                    no_df["Size"] = no_df["Size"].astype(float)
-                    no_df["Implied YES ask %"] = ((1 - no_df["Price ($)"]) * 100).round(1)
-                    st.dataframe(no_df.head(10), use_container_width=True, hide_index=True)
-                else:
-                    st.info("No no-bids available")
-
-            # Spread visualisation
-            if metrics.get("yes_bid") and metrics.get("yes_ask"):
-                st.divider()
-                st.markdown("**Bid/Ask Spread Visualisation**")
-                spread_data = pd.DataFrame({
-                    "Level": ["Yes Bid", "Mid", "Yes Ask"],
-                    "Price (¢)": [
-                        metrics["yes_bid"],
-                        metrics["mid"],
-                        metrics["yes_ask"],
-                    ]
-                })
-                st.bar_chart(spread_data.set_index("Level"))
-
+        # Assess market quality
+        if spread <= 2 and vol > 5000:
+            quality = "SHARP"
+        elif spread <= 4 and vol > 1000:
+            quality = "LIQUID"
         else:
-            st.warning("Could not fetch order book for this market.")
+            quality = "THIN"
+
+        if quality == "THIN":
+            return "⚪ SKIP", "#888", f"Thin market (spread {spread:.0f}¢, vol {vol:,.0f}) — signal unreliable"
+
+        # Key insight: in a sharp Kalshi market, the mid IS the fair line.
+        # Compare to what El Cortez typically posts:
+        # Favorites are usually OVERPRICED at retail books (public bets chalk)
+        # Underdogs 25-45¢ range are often UNDERPRICED at retail
+
+        fav_ml = implied_american(fav_mid)
+        dog_ml = implied_american(dog_mid)
+
+        if fav_mid >= 85:
+            verdict = "🟡 CHALK — LOW VALUE"
+            color = "#b8860b"
+            detail = (f"Kalshi has {fav_mid:.0f}% ({fav_ml}). "
+                      f"Retail books likely at similar or worse price. "
+                      f"Only bet if you find {implied_american(fav_mid+4)} or better at the window.")
+        elif 25 <= dog_mid <= 45 and quality == "SHARP":
+            verdict = "🟢 BET THE DOG"
+            color = "#2e8b57"
+            detail = (f"Kalshi sharp market says {dog_mid:.0f}% ({dog_ml}). "
+                      f"Public undervalues underdogs in this range. "
+                      f"Look for {implied_american(dog_mid - 5)} or better at El Cortez.")
+        elif 55 <= fav_mid <= 72 and quality in ("SHARP","LIQUID"):
+            verdict = "🟢 LIVE GAME WATCH"
+            color = "#2e8b57"
+            detail = (f"Close game ({fav_mid:.0f}/{dog_mid:.0f}). "
+                      f"Sharp money split. Watch for live line lag — "
+                      f"if momentum shifts, Kalshi reprices faster than the book.")
+        elif fav_mid > 72 and fav_mid < 85:
+            verdict = "🟡 FAV OK IF PRICE RIGHT"
+            color = "#b8860b"
+            detail = (f"Kalshi: {fav_mid:.0f}% ({fav_ml}). "
+                      f"Fair bet only if book is at {implied_american(fav_mid+3)} or worse (giving you value). "
+                      f"Skip if book is sharper than Kalshi.")
+        else:
+            verdict = "⚪ PASS"
+            color = "#888"
+            detail = f"No clear edge. Kalshi: {fav_mid:.0f}% fav / {dog_mid:.0f}% dog."
+
+        return verdict, color, detail
+
+    # ── Render game cards ────────────────────────────────────────────────────
+    game_list = sorted(games.items())
+    st.markdown(f"### 🏀 {len(game_list)} Games Today")
+
+    for event_ticker, game_markets in game_list:
+        game_markets.sort(key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True)
+        if len(game_markets) < 2:
+            continue
+
+        fav  = game_markets[0]
+        dog  = game_markets[1]
+        fav_m = compute_spread_metrics(fav)
+        dog_m = compute_spread_metrics(dog)
+
+        fav_name = fav.get("yes_sub_title") or fav.get("subtitle") or fav.get("ticker","").split("-")[-1]
+        dog_name = dog.get("yes_sub_title") or dog.get("subtitle") or dog.get("ticker","").split("-")[-1]
+        if fav_name == dog_name:
+            fav_name = fav.get("ticker","").split("-")[-1]
+            dog_name = dog.get("ticker","").split("-")[-1]
+
+        fav_vol  = float(fav.get("volume_fp", 0) or 0)
+        dog_vol  = float(dog.get("volume_fp", 0) or 0)
+        total_vol = fav_vol + dog_vol
+        spread   = fav_m.get("spread")
+        fav_mid  = fav_m.get("mid", 0)
+        dog_mid  = dog_m.get("mid", 0)
+
+        game_title = fav.get("title", event_ticker).replace(" Winner?","").replace(" winner?","").strip()
+
+        verdict, vcolor, detail = bet_verdict(fav_mid, dog_mid, spread, total_vol, None, None)
+
+        fav_american = implied_american(fav_mid)
+        dog_american = implied_american(dog_mid)
+
+        with st.container():
+            st.markdown(f"""
+<div style="border:1px solid #333; border-radius:12px; padding:16px; margin-bottom:12px; background:#1a1a1a;">
+  <div style="font-size:1.05em; font-weight:600; color:#ddd; margin-bottom:8px;">🏀 {game_title}</div>
+  <div style="font-size:1.6em; font-weight:800; color:{vcolor}; margin-bottom:10px;">{verdict}</div>
+  <div style="display:flex; gap:16px; margin-bottom:10px;">
+    <div style="flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;">
+      <div style="font-size:0.75em; color:#aaa; text-transform:uppercase;">FAV</div>
+      <div style="font-size:1.1em; font-weight:700; color:#fff;">{fav_name}</div>
+      <div style="font-size:1.4em; font-weight:800; color:#4fc3f7;">{fav_mid:.0f}¢</div>
+      <div style="font-size:0.9em; color:#aaa;">{fav_american}</div>
+    </div>
+    <div style="flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;">
+      <div style="font-size:0.75em; color:#aaa; text-transform:uppercase;">DOG</div>
+      <div style="font-size:1.1em; font-weight:700; color:#fff;">{dog_name}</div>
+      <div style="font-size:1.4em; font-weight:800; color:#ff8a65;">{dog_mid:.0f}¢</div>
+      <div style="font-size:0.9em; color:#aaa;">{dog_american}</div>
+    </div>
+    <div style="flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;">
+      <div style="font-size:0.75em; color:#aaa; text-transform:uppercase;">MARKET</div>
+      <div style="font-size:0.9em; color:#ccc;">Spread: {f"{spread:.1f}¢" if spread else "—"}</div>
+      <div style="font-size:0.9em; color:#ccc;">Vol: {total_vol:,.0f}</div>
+      <div style="font-size:0.9em; color:#ccc;">Vig: {f"{fav_m.get('total_vig',0):.1f}¢" if fav_m.get('total_vig') else "—"}</div>
+    </div>
+  </div>
+  <div style="background:#111; border-left:3px solid {vcolor}; padding:8px 12px; border-radius:4px; font-size:0.88em; color:#ccc;">
+    💡 {detail}
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 
