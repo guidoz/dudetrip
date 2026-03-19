@@ -40,46 +40,95 @@ def kalshi_headers(api_key):
 
 @st.cache_data(ttl=30)
 def fetch_ncaa_markets(api_key):
-    """Fetch all open NCAA basketball markets."""
-    markets = []
-    search_terms = ["NCAA", "NCAAB", "March Madness", "basketball"]
+    """
+    Fetch all open NCAA basketball markets by:
+    1. Searching events with category=sports, paginating through all open events
+    2. Filtering by NCAA/basketball/March Madness keywords in title
+    3. Collecting all nested markets from matching events
+    """
+    NCAA_KEYWORDS = ["ncaa", "march madness", "basketball", "ncaab", "college basketball",
+                     "tournament", "duke", "arizona", "florida", "michigan", "houston"]
     
-    # Try known series tickers first
-    for series in ["NCAAB", "MARCHMADNESS", "KXNCAAB", "NCAA"]:
-        url = f"{BASE_URL}/markets"
-        params = {"series_ticker": series, "status": "open", "limit": 100}
+    all_markets = []
+    seen_tickers = set()
+
+    # --- Strategy 1: paginate through open sports events ---
+    cursor = None
+    pages = 0
+    while pages < 10:  # safety cap
+        params = {
+            "status": "open",
+            "limit": 200,
+            "with_nested_markets": "true",
+        }
+        if cursor:
+            params["cursor"] = cursor
         try:
-            r = requests.get(url, params=params, headers=kalshi_headers(api_key), timeout=8)
+            r = requests.get(
+                f"{BASE_URL}/events",
+                params=params,
+                headers=kalshi_headers(api_key),
+                timeout=10,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            events = data.get("events", [])
+            for event in events:
+                title = (event.get("title", "") + " " + event.get("sub_title", "")).lower()
+                if any(kw in title for kw in NCAA_KEYWORDS):
+                    for m in event.get("markets", []):
+                        if m["ticker"] not in seen_tickers:
+                            seen_tickers.add(m["ticker"])
+                            all_markets.append(m)
+            cursor = data.get("cursor")
+            if not cursor or not events:
+                break
+            pages += 1
+        except Exception:
+            break
+
+    # --- Strategy 2: directly try known KX-style NCAA series tickers ---
+    CANDIDATE_SERIES = [
+        "KXNCAAB", "KXMARCHMADNESS", "KXCBB", "KXNCAATOURNEY",
+        "KXNCAAT", "KXMM26", "KXNCAAB26",
+    ]
+    for series in CANDIDATE_SERIES:
+        try:
+            r = requests.get(
+                f"{BASE_URL}/markets",
+                params={"series_ticker": series, "status": "open", "limit": 200},
+                headers=kalshi_headers(api_key),
+                timeout=8,
+            )
             if r.status_code == 200:
-                data = r.json().get("markets", [])
-                markets.extend(data)
+                for m in r.json().get("markets", []):
+                    if m["ticker"] not in seen_tickers:
+                        seen_tickers.add(m["ticker"])
+                        all_markets.append(m)
         except Exception:
             pass
 
-    # Fallback: search by category/keyword
-    if not markets:
-        url = f"{BASE_URL}/markets"
-        params = {"status": "open", "limit": 200}
+    # --- Strategy 3: broad open markets scan, keyword filter ---
+    if not all_markets:
         try:
-            r = requests.get(url, params=params, headers=kalshi_headers(api_key), timeout=8)
+            r = requests.get(
+                f"{BASE_URL}/markets",
+                params={"status": "open", "limit": 1000},
+                headers=kalshi_headers(api_key),
+                timeout=10,
+            )
             if r.status_code == 200:
-                all_markets = r.json().get("markets", [])
-                markets = [
-                    m for m in all_markets
-                    if any(t.lower() in (m.get("title", "") + m.get("ticker", "")).lower()
-                           for t in search_terms)
-                ]
+                for m in r.json().get("markets", []):
+                    title = (m.get("title", "") + " " + m.get("ticker", "")).lower()
+                    if any(kw in title for kw in NCAA_KEYWORDS):
+                        if m["ticker"] not in seen_tickers:
+                            seen_tickers.add(m["ticker"])
+                            all_markets.append(m)
         except Exception:
             pass
 
-    # Deduplicate by ticker
-    seen = set()
-    unique = []
-    for m in markets:
-        if m["ticker"] not in seen:
-            seen.add(m["ticker"])
-            unique.append(m)
-    return unique
+    return all_markets
 
 @st.cache_data(ttl=15)
 def fetch_orderbook(api_key, ticker):
@@ -209,16 +258,61 @@ with st.spinner("Fetching Kalshi NCAA markets..."):
     markets = fetch_ncaa_markets(api_key)
 
 if not markets:
-    st.error("No open NCAA markets found. Kalshi may use a different series ticker — try the manual search below.")
-    
-    st.subheader("🔍 Manual market search")
-    manual_ticker = st.text_input("Enter a market ticker directly (e.g. NCAAB-2026-DUKE-WIN)")
-    if manual_ticker:
-        detail = fetch_market_detail(api_key, manual_ticker.upper())
-        if detail:
-            markets = [detail]
-        else:
-            st.error(f"Could not find ticker: {manual_ticker}")
+    st.warning("No NCAA markets found via auto-discovery. Let's diagnose and search manually.")
+
+    # Diagnostic: show a sample of what IS open on Kalshi right now
+    with st.expander("🔍 Diagnostic — show all open Kalshi events (to find real tickers)"):
+        try:
+            r = requests.get(
+                f"{BASE_URL}/events",
+                params={"status": "open", "limit": 50, "with_nested_markets": "false"},
+                headers=kalshi_headers(api_key),
+                timeout=10,
+            )
+            if r.status_code == 200:
+                events = r.json().get("events", [])
+                if events:
+                    diag_df = pd.DataFrame([
+                        {"event_ticker": e.get("event_ticker"), "title": e.get("title"), "category": e.get("category")}
+                        for e in events
+                    ])
+                    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+                    st.caption("Use an event_ticker from above to search for its markets below.")
+                else:
+                    st.write(r.json())
+            else:
+                st.error(f"API error {r.status_code}: {r.text}")
+        except Exception as ex:
+            st.error(f"Request failed: {ex}")
+
+    st.subheader("🔍 Manual search by event or market ticker")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        manual_event = st.text_input("Event ticker (e.g. KXNCAAB-2026-DUKE)")
+        if manual_event:
+            try:
+                r = requests.get(
+                    f"{BASE_URL}/events/{manual_event.upper()}",
+                    params={"with_nested_markets": "true"},
+                    headers=kalshi_headers(api_key),
+                    timeout=8,
+                )
+                if r.status_code == 200:
+                    markets = r.json().get("event", {}).get("markets", [])
+                    st.success(f"Found {len(markets)} markets in event {manual_event.upper()}")
+                else:
+                    st.error(f"Not found ({r.status_code})")
+            except Exception as ex:
+                st.error(str(ex))
+    with col_b:
+        manual_ticker = st.text_input("Market ticker (e.g. KXNCAAB-2026-DUKE-WIN)")
+        if manual_ticker:
+            detail = fetch_market_detail(api_key, manual_ticker.upper())
+            if detail:
+                markets = [detail]
+                st.success(f"Found market: {detail.get('title')}")
+            else:
+                st.error(f"Could not find ticker: {manual_ticker}")
 
 if markets:
     st.success(f"Found **{len(markets)}** open NCAA markets on Kalshi")
