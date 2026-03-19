@@ -17,7 +17,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -154,6 +154,24 @@ def fetch_ncaa_markets(api_key):
         except Exception:
             pass
 
+    # Filter to only markets open right now (status=open) and closing today/soon
+    # Also filter out markets whose close_time is in the future > 24h (upcoming games)
+    # We want: games happening TODAY only
+    now = datetime.now(timezone.utc)
+    def is_today(m):
+        close = m.get("close_time") or m.get("expiration_time") or ""
+        if not close:
+            return True  # no close time, include it
+        try:
+            ct = datetime.fromisoformat(close.replace("Z", "+00:00"))
+            hours_until_close = (ct - now).total_seconds() / 3600
+            # Keep markets closing within next 12 hours (today's games)
+            # or already closed in last 2 hours (live/just finished)
+            return -2 <= hours_until_close <= 12
+        except Exception:
+            return True
+
+    all_markets = [m for m in all_markets if is_today(m)]
     return all_markets
 
 @st.cache_data(ttl=15)
@@ -341,35 +359,80 @@ if not markets:
                 st.error(f"Could not find ticker: {manual_ticker}")
 
 if markets:
-    st.success(f"Found **{len(markets)}** open NCAA markets on Kalshi")
-
-    # Build summary table
-    rows = []
+    # Group markets by event_ticker — each game has multiple markets (YES team A, YES team B, spread, total)
+    # We want one row per GAME not one row per contract
+    from collections import defaultdict
+    games = defaultdict(list)
     for m in markets:
-        metrics = compute_spread_metrics(m)
-        volume = float(m.get("volume_fp", 0) or 0)
-        rows.append({
-            "Ticker": m.get("ticker", ""),
-            "Title": m.get("title", "")[:60],
-            "Yes Bid ¢": f"{metrics.get('yes_bid', 0):.1f}",
-            "Yes Ask ¢": f"{metrics.get('yes_ask', 0):.1f}",
-            "Mid ¢": f"{metrics.get('mid', 0):.1f}",
-            "Spread ¢": f"{metrics.get('spread', '—'):.1f}" if metrics.get('spread') is not None else "—",
-            "Vig ¢": f"{metrics.get('total_vig', '—'):.1f}" if metrics.get('total_vig') is not None else "—",
-            "Volume": f"{volume:,.0f}",
-            "Signal": edge_signal(metrics.get("mid", 0), metrics.get("spread"), volume),
-        })
+        event = m.get("event_ticker", m.get("ticker", ""))
+        games[event].append(m)
+
+    st.success(f"Found **{len(games)}** games · **{len(markets)}** markets on Kalshi")
+
+    # Build one row per game
+    rows = []
+    for event_ticker, game_markets in sorted(games.items()):
+        # Sort markets by yes_bid descending so the favorite comes first
+        game_markets.sort(key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True)
+
+        if len(game_markets) >= 2:
+            fav = game_markets[0]
+            dog = game_markets[1]
+            fav_name = fav.get("yes_sub_title") or fav.get("subtitle") or fav.get("ticker", "").split("-")[-1]
+            dog_name = dog.get("yes_sub_title") or dog.get("subtitle") or dog.get("ticker", "").split("-")[-1]
+            # Fall back to title if subtitles are same
+            if fav_name == dog_name:
+                fav_name = fav.get("ticker", "").split("-")[-1]
+                dog_name = dog.get("ticker", "").split("-")[-1]
+            fav_m = compute_spread_metrics(fav)
+            dog_m = compute_spread_metrics(dog)
+            fav_vol = float(fav.get("volume_fp", 0) or 0)
+            dog_vol = float(dog.get("volume_fp", 0) or 0)
+            total_vol = fav_vol + dog_vol
+            spread = fav_m.get("spread")
+            signal = edge_signal(fav_m.get("mid", 0), spread, total_vol)
+            # Derive game title from the shared market title (strip "Winner?" etc)
+            game_title = fav.get("title", event_ticker)
+            game_title = game_title.replace(" Winner?", "").replace(" winner?", "").strip()
+            rows.append({
+                "Game": game_title,
+                "Favorite": fav_name,
+                "Fav Mid ¢": f"{fav_m.get('mid', 0):.1f}",
+                "Fav Spread ¢": f"{spread:.1f}" if spread is not None else "—",
+                "Underdog": dog_name,
+                "Dog Mid ¢": f"{dog_m.get('mid', 0):.1f}",
+                "Total Vol": f"{total_vol:,.0f}",
+                "Signal": signal,
+                "_event": event_ticker,
+            })
+        else:
+            # Single market (total, spread line, etc) — show as-is
+            m = game_markets[0]
+            metrics = compute_spread_metrics(m)
+            volume = float(m.get("volume_fp", 0) or 0)
+            rows.append({
+                "Game": m.get("title", event_ticker)[:55],
+                "Favorite": "—",
+                "Fav Mid ¢": f"{metrics.get('mid', 0):.1f}",
+                "Fav Spread ¢": f"{metrics.get('spread', 0):.1f}" if metrics.get('spread') is not None else "—",
+                "Underdog": "—",
+                "Dog Mid ¢": "—",
+                "Total Vol": f"{volume:,.0f}",
+                "Signal": edge_signal(metrics.get("mid", 0), metrics.get("spread"), volume),
+                "_event": event_ticker,
+            })
 
     df = pd.DataFrame(rows)
+    display_df = df.drop(columns=["_event"])
 
     # Highlight sharp markets
-    sharp = df[df["Signal"] == "🟢 Sharp market"]
+    sharp = display_df[display_df["Signal"] == "🟢 Sharp market"]
     if not sharp.empty:
         st.subheader("🟢 Sharp Markets — Tight Spreads, High Volume")
         st.dataframe(sharp, use_container_width=True, hide_index=True)
 
-    st.subheader("📊 All Open NCAA Markets")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.subheader("📊 Today's Games")
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     # ── Order book deep dive ──────────────────────────────────────────────────
 
@@ -377,10 +440,16 @@ if markets:
         st.divider()
         st.subheader("📖 Order Book Deep Dive")
         
+        # Build friendly label: "Game — Team" using subtitle for the team name
+        def market_label(m):
+            game = m.get("title", "").replace(" Winner?", "").strip()
+            team = m.get("yes_sub_title") or m.get("subtitle") or m.get("ticker","").split("-")[-1]
+            return f"{game} — {team}"
+
         tickers = [m["ticker"] for m in markets]
-        selected = st.selectbox("Select a market", tickers,
-                                format_func=lambda t: next(
-                                    (m["title"] for m in markets if m["ticker"] == t), t))
+        ticker_labels = {m["ticker"]: market_label(m) for m in markets}
+        selected = st.selectbox("Select a team/market", tickers,
+                                format_func=lambda t: ticker_labels.get(t, t))
 
         ob = fetch_orderbook(api_key, selected)
         detail = fetch_market_detail(api_key, selected)
