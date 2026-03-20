@@ -1,13 +1,3 @@
-## “””
-March Madness Kalshi Live Dashboard v2
-
-Streamlit app. Deploy free at streamlit.io/cloud.
-Set KALSHI_API_KEY in Streamlit Cloud > App Settings > Secrets.
-
-pip install streamlit requests pandas
-streamlit run kalshi_dashboard.py
-“””
-
 import streamlit as st
 import requests
 import pandas as pd
