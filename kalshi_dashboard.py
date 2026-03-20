@@ -354,33 +354,27 @@ def market_quality(spread, volume):
 def _extract_levels(orderbook, side):
     """
     Extract list of (price_cents, quantity) from the orderbook.
-    Handles multiple Kalshi orderbook_fp formats:
-      - {"yes": {"bids": [[p,q], ...]}}       (nested with bids key)
-      - {"yes": [[p,q], ...]}                  (flat list)
-      - {"yes": [{"price":p, "quantity":q}]}   (list of dicts)
+    Kalshi orderbook_fp format:
+      {"yes_dollars": [["0.6500", "150.00"], ...], "no_dollars": [...]}
+    side = 'yes' or 'no'  ->  looks up 'yes_dollars' or 'no_dollars'
+    Prices come in dollars, we convert to cents.
     """
     levels = []
     try:
-        side_data = orderbook.get(side, {})
-        if side_data is None:
-            return levels
-
-        # If side_data is a list directly: [entries...]
-        if isinstance(side_data, list):
-            raw = side_data
-        elif isinstance(side_data, dict):
-            # Try common sub-keys: bids, asks, or just take all list values
-            raw = side_data.get("bids", [])
-            if not raw:
-                raw = side_data.get("asks", [])
-            if not raw:
-                # Maybe the dict values are themselves lists of levels
-                for v in side_data.values():
-                    if isinstance(v, list) and v:
-                        raw = v
-                        break
-        else:
-            return levels
+        # Primary key: yes_dollars / no_dollars
+        raw = orderbook.get(side + "_dollars", [])
+        # Fallback: try bare yes / no
+        if not raw:
+            side_data = orderbook.get(side, {})
+            if isinstance(side_data, list):
+                raw = side_data
+            elif isinstance(side_data, dict):
+                raw = side_data.get("bids", []) or side_data.get("asks", [])
+                if not raw:
+                    for v in side_data.values():
+                        if isinstance(v, list) and v:
+                            raw = v
+                            break
 
         for entry in raw:
             price = 0
@@ -389,11 +383,13 @@ def _extract_levels(orderbook, side):
                 price = float(entry[0])
                 qty   = float(entry[1])
             elif isinstance(entry, dict):
-                # Try multiple possible key names
                 price = float(entry.get("price", 0) or entry.get("price_cents", 0) or 0)
                 qty   = float(entry.get("quantity", 0) or entry.get("count", 0) or entry.get("size", 0) or 0)
             else:
                 continue
+            # If prices look like dollars (< 1.0), convert to cents
+            if 0 < price <= 1.0:
+                price = price * 100
             if qty > 0 and price > 0:
                 levels.append((price, qty))
     except Exception:
@@ -454,6 +450,16 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
     dog_yes_bids = _extract_levels(ob_dog, "yes")
     dog_no_bids  = _extract_levels(ob_dog, "no")
 
+    # Filter out dust orders at extreme prices (< 5c and > 95c)
+    # These are lottery tickets, not real conviction — they swamp the signal
+    def _filter_dust(levels, lo=5, hi=95):
+        return [(p, q) for p, q in levels if lo <= p <= hi]
+
+    fav_yes_bids = _filter_dust(fav_yes_bids)
+    fav_no_bids  = _filter_dust(fav_no_bids)
+    dog_yes_bids = _filter_dust(dog_yes_bids)
+    dog_no_bids  = _filter_dust(dog_no_bids)
+
     # All levels combined for entropy calculation
     all_levels = fav_yes_bids + fav_no_bids + dog_yes_bids + dog_no_bids
     if not all_levels:
@@ -463,8 +469,9 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
 
     # ── Signal 1: Book Imbalance Ratio ──────────────────────────────────
     # Dollar-volume on the YES/fav side vs YES/dog side
-    # fav_side_dollars = fav YES bids + dog NO bids (both want fav to win)
-    # dog_side_dollars = dog YES bids + fav NO bids (both want dog to win)
+    # price is in cents (converted), qty is contract count, so p*q ~ dollar exposure
+    # fav_side = fav YES bids + dog NO bids (both want fav to win)
+    # dog_side = dog YES bids + fav NO bids (both want dog to win)
     fav_side_dollars = sum(p * q for p, q in fav_yes_bids) + sum(p * q for p, q in dog_no_bids)
     dog_side_dollars = sum(p * q for p, q in dog_yes_bids) + sum(p * q for p, q in fav_no_bids)
     total_dollars    = fav_side_dollars + dog_side_dollars
