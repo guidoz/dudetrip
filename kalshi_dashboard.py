@@ -9,8 +9,6 @@ from collections import defaultdict
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
 
-# ── ESPN name normalization ─────────────────────────────────────────────────
-
 TEAM_NAME_ALIASES = {
     "connecticut": "uconn",
     "north carolina": "unc",
@@ -31,15 +29,8 @@ def normalize_name(name: str) -> str:
     n = name.lower().strip()
     return TEAM_NAME_ALIASES.get(n, n)
 
-# ── ESPN data layer ─────────────────────────────────────────────────────────
-
 @st.cache_data(ttl=15)
 def fetch_espn_games():
-    """
-    Returns (by_team, raw_games).
-    by_team: normalized team name -> game_info dict
-    raw_games: list of all game_info dicts
-    """
     try:
         r = requests.get(ESPN_URL, timeout=8)
         if r.status_code != 200:
@@ -57,7 +48,6 @@ def fetch_espn_games():
             continue
         comp = competitions[0]
 
-        # Tip-off time
         start_str = event.get("date", "")
         try:
             start_dt    = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
@@ -66,10 +56,9 @@ def fetch_espn_games():
         except Exception:
             tipoff = start_str[:16] if start_str else "TBD"
 
-        # Status
         status_obj    = event.get("status", {})
         status_type   = status_obj.get("type", {})
-        status_state  = status_type.get("state", "pre")   # pre / in / post
+        status_state  = status_type.get("state", "pre")
         status_detail = status_type.get("shortDetail", "")
         display_clock = status_obj.get("displayClock", "")
         period        = status_obj.get("period", 0)
@@ -110,7 +99,6 @@ def fetch_espn_games():
     return by_team, raw_games
 
 def espn_lookup(espn_by_team, kalshi_name: str):
-    """Returns (game_info, team_dict) or (None, None)."""
     norm = normalize_name(kalshi_name)
     if norm in espn_by_team:
         game = espn_by_team[norm]
@@ -121,7 +109,6 @@ def espn_lookup(espn_by_team, kalshi_name: str):
     return None, None
 
 def format_score_line(game_info, fav_name, dog_name):
-    """Short score/status string for the mkt-strip."""
     if game_info is None:
         return None
     state    = game_info["status_state"]
@@ -137,14 +124,11 @@ def format_score_line(game_info, fav_name, dog_name):
         if fav_t and dog_t and fav_t["score"] is not None:
             return "FINAL " + str(fav_t["score"]) + "-" + str(dog_t["score"])
         return "FINAL"
-    # in-progress
     half  = "1H" if game_info["period"] == 1 else "2H" if game_info["period"] == 2 else "OT"
     clock = game_info["display_clock"]
     if fav_t and dog_t and fav_t["score"] is not None:
         return str(fav_t["score"]) + "-" + str(dog_t["score"]) + " " + half + " " + clock
     return half + " " + clock
-
-# ── Helpers ────────────────────────────────────────────────────────────────
 
 def get_api_key():
     try:
@@ -180,13 +164,8 @@ def value_target(kalshi_mid, min_edge_pct=2.0):
         target_implied = 99
     return prob_to_american(target_implied)
 
-# ── Time filter ────────────────────────────────────────────────────────────
-
 def _filter_and_sort(markets):
-    """Only return open/active markets. Never show settled or closed games."""
     return [m for m in markets if (m.get("status") or "").lower() in ("open", "active", "")]
-
-# ── API fetchers ───────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=15)
 def fetch_ncaa_markets(api_key):
@@ -295,8 +274,6 @@ def fetch_market_detail(api_key, ticker):
         pass
     return {}
 
-# ── Spread metrics ─────────────────────────────────────────────────────────
-
 def compute_spread_metrics(market):
     try:
         yes_bid = float(market.get("yes_bid_dollars", 0) or 0) * 100
@@ -349,21 +326,20 @@ def market_quality(spread, volume):
         return "WIDE", "W", -1
     return "OK", "O", 0
 
-# ── Book Conviction Scoring ────────────────────────────────────────────────
+QUALITY_LABELS = {
+    "SHARP":  "Active market",
+    "SOLID":  "Good market",
+    "LIQUID": "Decent activity",
+    "THIN":   "Low activity",
+    "WIDE":   "Unreliable",
+    "DEAD":   "No market",
+    "OK":     "OK",
+}
 
 def _extract_levels(orderbook, side):
-    """
-    Extract list of (price_cents, quantity) from the orderbook.
-    Kalshi orderbook_fp format:
-      {"yes_dollars": [["0.6500", "150.00"], ...], "no_dollars": [...]}
-    side = 'yes' or 'no'  ->  looks up 'yes_dollars' or 'no_dollars'
-    Prices come in dollars, we convert to cents.
-    """
     levels = []
     try:
-        # Primary key: yes_dollars / no_dollars
         raw = orderbook.get(side + "_dollars", [])
-        # Fallback: try bare yes / no
         if not raw:
             side_data = orderbook.get(side, {})
             if isinstance(side_data, list):
@@ -387,7 +363,6 @@ def _extract_levels(orderbook, side):
                 qty   = float(entry.get("quantity", 0) or entry.get("count", 0) or entry.get("size", 0) or 0)
             else:
                 continue
-            # If prices look like dollars (< 1.0), convert to cents
             if 0 < price <= 1.0:
                 price = price * 100
             if qty > 0 and price > 0:
@@ -398,27 +373,13 @@ def _extract_levels(orderbook, side):
 
 
 def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
-    """
-    Compute Book Conviction Scoring from order books.
-
-    Returns dict with:
-      bir        - Book Imbalance Ratio (0-1, <0.5 = dog-side pressure)
-      entropy    - Shannon entropy of order sizes, normalized 0-1
-      depth_grad - Depth gradient (0-1, high = fragile/cliff)
-      confidence - Combined confidence weight
-      adjusted_prob - Bayesian-adjusted dog probability
-      narrative  - One-liner explanation
-      signal     - 'DOG', 'FAV', or 'NEUTRAL'
-      strength   - 'STRONG', 'MODERATE', 'WEAK', or 'NOISE'
-    """
     result = {
         "bir": 0.5, "entropy": 1.0, "depth_grad": 0.5,
         "confidence": 0.0, "adjusted_prob": dog_mid,
-        "narrative": "No order book data.", "signal": "NEUTRAL",
+        "narrative": "No betting data available.", "signal": "EVEN",
         "strength": "NOISE", "has_data": False, "debug": "",
     }
 
-    # Debug: capture the structure of what we got
     def _describe_ob(ob):
         if not ob:
             return "empty"
@@ -440,18 +401,11 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
 
     result["debug"] = "fav_ob=" + _describe_ob(ob_fav) + " /// dog_ob=" + _describe_ob(ob_dog)
 
-    # Collect all order levels from both books
-    # YES bids on fav = money backing the favorite
-    # YES bids on dog = money backing the dog
-    # NO bids on fav  = also money backing the dog (betting against fav)
-    # NO bids on dog  = also money backing the fav (betting against dog)
     fav_yes_bids = _extract_levels(ob_fav, "yes")
     fav_no_bids  = _extract_levels(ob_fav, "no")
     dog_yes_bids = _extract_levels(ob_dog, "yes")
     dog_no_bids  = _extract_levels(ob_dog, "no")
 
-    # Filter out dust orders at extreme prices (< 5c and > 95c)
-    # These are lottery tickets, not real conviction — they swamp the signal
     def _filter_dust(levels, lo=5, hi=95):
         return [(p, q) for p, q in levels if lo <= p <= hi]
 
@@ -460,30 +414,22 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
     dog_yes_bids = _filter_dust(dog_yes_bids)
     dog_no_bids  = _filter_dust(dog_no_bids)
 
-    # All levels combined for entropy calculation
     all_levels = fav_yes_bids + fav_no_bids + dog_yes_bids + dog_no_bids
     if not all_levels:
         return result
 
     result["has_data"] = True
 
-    # ── Signal 1: Book Imbalance Ratio ──────────────────────────────────
-    # Dollar-volume on the YES/fav side vs YES/dog side
-    # price is in cents (converted), qty is contract count, so p*q ~ dollar exposure
-    # fav_side = fav YES bids + dog NO bids (both want fav to win)
-    # dog_side = dog YES bids + fav NO bids (both want dog to win)
     fav_side_dollars = sum(p * q for p, q in fav_yes_bids) + sum(p * q for p, q in dog_no_bids)
     dog_side_dollars = sum(p * q for p, q in dog_yes_bids) + sum(p * q for p, q in fav_no_bids)
     total_dollars    = fav_side_dollars + dog_side_dollars
 
     if total_dollars > 0:
-        bir = fav_side_dollars / total_dollars  # >0.5 = fav leaning, <0.5 = dog leaning
+        bir = fav_side_dollars / total_dollars
     else:
         bir = 0.5
     result["bir"] = round(bir, 3)
 
-    # ── Signal 2: Book Entropy ──────────────────────────────────────────
-    # Shannon entropy of order quantities across all price levels
     quantities = [q for _, q in all_levels]
     total_qty  = sum(quantities)
 
@@ -496,13 +442,9 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
         entropy = 1.0
     result["entropy"] = round(entropy, 3)
 
-    # ── Signal 3: Depth Gradient ────────────────────────────────────────
-    # How much volume is concentrated at the best (top) level vs total
-    # Compute separately for each side, take the worse (more fragile) one
     def _depth_ratio(levels):
         if not levels:
             return 0.5
-        # Sort by price descending (best bid = highest price)
         sorted_lvls = sorted(levels, key=lambda x: x[0], reverse=True)
         best_qty    = sorted_lvls[0][1]
         total       = sum(q for _, q in sorted_lvls)
@@ -512,31 +454,21 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
 
     depth_fav = _depth_ratio(fav_yes_bids + dog_no_bids)
     depth_dog = _depth_ratio(dog_yes_bids + fav_no_bids)
-    # Overall fragility: max of both sides (worst case)
     depth_grad = max(depth_fav, depth_dog)
     result["depth_grad"] = round(depth_grad, 3)
 
-    # ── Bayesian Engine ─────────────────────────────────────────────────
-    # prior = Kalshi mid-price for the dog (already our best estimate)
-    prior = dog_mid / 100.0  # Convert to 0-1
-
-    # Book-implied dog probability from BIR
-    book_implied_dog = 1.0 - bir  # If bir=0.4, 60% of money is dog-side
-
-    # Confidence = (1 - entropy) × (1 - depth_grad)
-    # Low entropy + low fragility = high confidence
+    prior = dog_mid / 100.0
+    book_implied_dog = 1.0 - bir
     depth_stability = 1.0 - depth_grad
     confidence = (1.0 - entropy) * depth_stability
     confidence = max(0.0, min(1.0, confidence))
     result["confidence"] = round(confidence, 3)
 
-    # Weighted blend: adjusted = prior × (1 - confidence) + book_implied × confidence
     adjusted = prior * (1.0 - confidence) + book_implied_dog * confidence
     adjusted = max(0.01, min(0.99, adjusted))
     adjusted_pct = adjusted * 100.0
     result["adjusted_prob"] = round(adjusted_pct, 1)
 
-    # ── Signal classification ───────────────────────────────────────────
     imbalance_magnitude = abs(bir - 0.5)
 
     if confidence >= 0.4 and imbalance_magnitude >= 0.08:
@@ -549,65 +481,33 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
         result["strength"] = "NOISE"
 
     if bir < 0.47:
-        result["signal"] = "DOG"
+        result["signal"] = "UNDERDOG"
     elif bir > 0.53:
-        result["signal"] = "FAV"
+        result["signal"] = "FAVORITE"
     else:
-        result["signal"] = "NEUTRAL"
+        result["signal"] = "EVEN"
 
-    # ── Narrative ───────────────────────────────────────────────────────
     dog_pct = round((1.0 - bir) * 100)
     fav_pct = round(bir * 100)
 
     if result["strength"] == "NOISE":
-        result["narrative"] = (
-            "Book is " + str(fav_pct) + "/" + str(dog_pct) + " but entropy is "
-            + str(round(entropy, 2)) + " — nobody agrees. "
-            + "Model defaults to mid: " + str(round(adjusted_pct, 1)) + "%. Pass unless you want chaos."
-        )
-    elif result["signal"] == "DOG" and result["strength"] == "STRONG":
+        result["narrative"] = "🤷 Bettors are all over the place — no useful signal here."
+    elif result["signal"] == "UNDERDOG" and result["strength"] == "STRONG":
         if depth_grad > 0.7:
-            result["narrative"] = (
-                "Pressure " + str(dog_pct) + "% dog-side, high conviction (ent " + str(round(entropy, 2))
-                + ") — but it's all on one cliff (depth " + str(round(depth_grad, 2))
-                + "). One whale holding the price. High risk, high story."
-            )
+            result["narrative"] = "🔥 Smart money is backing the underdog hard — but it might be one big bettor. Odds could vanish fast."
         else:
-            result["narrative"] = (
-                "Pressure " + str(dog_pct) + "% dog-side with high conviction (ent "
-                + str(round(entropy, 2)) + ", depth " + str(round(depth_grad, 2))
-                + "). Model says " + str(round(adjusted_pct, 1)) + "%. Book is leaning."
-            )
-    elif result["signal"] == "DOG" and result["strength"] == "MODERATE":
-        result["narrative"] = (
-            "Pressure " + str(dog_pct) + "% dog-side, moderate conviction (ent "
-            + str(round(entropy, 2)) + "). Model nudges to " + str(round(adjusted_pct, 1))
-            + "%. Lean dog but size down."
-        )
-    elif result["signal"] == "FAV" and result["strength"] in ("STRONG", "MODERATE"):
-        result["narrative"] = (
-            "Pressure " + str(fav_pct) + "% fav-side"
-            + (" with strong conviction" if result["strength"] == "STRONG" else "")
-            + " (ent " + str(round(entropy, 2))
-            + "). Book confirms the chalk. Dog prob drops to "
-            + str(round(adjusted_pct, 1)) + "%."
-        )
-    elif result["signal"] == "NEUTRAL":
-        result["narrative"] = (
-            "Book is split " + str(fav_pct) + "/" + str(dog_pct)
-            + " — market hasn't picked a side. Entropy " + str(round(entropy, 2))
-            + ". Model stays near mid: " + str(round(adjusted_pct, 1)) + "%."
-        )
+            result["narrative"] = "🔥 Smart money is quietly backing the underdog. This line won't last — act now."
+    elif result["signal"] == "UNDERDOG" and result["strength"] == "MODERATE":
+        result["narrative"] = "📈 More money is going on the underdog than you'd expect. Slight lean — bet smaller."
+    elif result["signal"] == "FAVORITE" and result["strength"] in ("STRONG", "MODERATE"):
+        result["narrative"] = "✋ Most money is on the favorite and bettors agree. The underdog is less of a value than it looks."
+    elif result["signal"] == "EVEN":
+        result["narrative"] = "⚖️ Nobody has picked a side yet. Wait and see, or go with the main recommendation."
     else:
-        result["narrative"] = (
-            "Weak lean " + result["signal"].lower() + "-side (" + str(dog_pct) + "% dog). "
-            + "Low confidence. Model: " + str(round(adjusted_pct, 1)) + "%."
-        )
+        result["narrative"] = "💤 Weak signal — not enough conviction either way to change anything."
 
     return result
 
-
-# ── Live lag detection ─────────────────────────────────────────────────────
 
 MAX_HISTORY = 30
 
@@ -651,7 +551,6 @@ def compute_live_lag(ticker: str, current_mid: float,
         "old_mid":     round(reference[1], 1),
     }
 
-# ── Core analysis engine ──────────────────────────────────────────────────
 
 def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name):
     result = {
@@ -664,7 +563,7 @@ def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name):
     q_label, q_icon, q_score = market_quality(spread, volume)
 
     if q_score < 0 or (spread is None and volume < 100):
-        result["detail"]  = "Market too thin (spread " + str(spread or "?") + " cents, vol " + str(int(volume)) + "). Price is noise."
+        result["detail"]  = "Not enough betting activity to trust this price (buy/sell gap: " + str(spread or "?") + " cents, total bets: " + str(int(volume)) + "). The odds here are unreliable."
         result["verdict"] = "SKIP"
         result["color"]   = "#666"
         return result
@@ -686,72 +585,71 @@ def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name):
     if q_label in ("DEAD", "WIDE"):
         result["verdict"]     = "SKIP"
         result["color"]       = "#666"
-        result["detail"]      = "Spread is " + str(int(spread)) + " cents wide. Price could be off by 5-10 cents either way."
+        result["detail"]      = "The buy/sell gap is " + str(int(spread)) + " cents wide — the price could be off by 5–10 cents in either direction. Don't use this as a signal."
         result["action_line"] = "Don't use this as a signal."
         return result
 
-    thin_warning = " (thin — half size)" if q_label == "THIN" else ""
+    thin_warning = " (low activity — consider betting half your normal amount)" if q_label == "THIN" else ""
 
     if fav_mid >= 85:
-        result["verdict"] = "HEAVY CHALK"
+        result["verdict"] = "BIG FAVORITE — SKIP"
         result["color"]   = "#b8860b"
-        result["detail"]  = (fav_name + " at " + str(int(fav_mid)) + "% (" + fav_fair + "). "
-                             + "Retail probably posts " + retail_fav_odds + " or worse. Risk/reward is bad." + thin_warning)
-        result["action_line"] = ("Skip the fav. Only play: " + dog_name
-                                 + " at " + dog_target + " or better. Otherwise pass.")
+        result["detail"]  = (fav_name + " is " + str(int(fav_mid)) + "% likely to win (" + fav_fair + "). "
+                             + "Sportsbooks probably post " + retail_fav_odds + " or worse. The risk/reward is bad." + thin_warning)
+        result["action_line"] = ("Skip betting the favorite. Only play: " + dog_name
+                                 + " at " + dog_target + " or better odds. Otherwise pass.")
 
     elif 20 <= dog_mid <= 45 and q_score >= 2:
-        result["verdict"] = "DOG VALUE"
+        result["verdict"] = "UNDERDOG OPPORTUNITY"
         result["color"]   = "#2ecc71"
-        result["detail"]  = ("Sharp market: " + dog_name + " wins " + str(int(dog_mid)) + "% (" + dog_fair + "). "
-                             + "Retail typically posts " + retail_dog_odds + ", underpriced by ~"
+        result["detail"]  = ("The informed market says " + dog_name + " has a " + str(int(dog_mid)) + "% chance to win (" + dog_fair + "). "
+                             + "Sportsbooks typically post " + retail_dog_odds + ", meaning they're undervaluing this team by ~"
                              + str(round(result["edge_dog_cents"], 1)) + " cents." + thin_warning)
-        result["action_line"] = ("AT THE WINDOW: " + dog_name + " at " + dog_target + " or better. "
-                                 + "Board shows " + retail_dog_odds + " or higher = bet it.")
+        result["action_line"] = ("RECOMMENDED BET: " + dog_name + " at " + dog_target + " or better odds. "
+                                 + "If your sportsbook shows " + retail_dog_odds + " or higher = bet it.")
 
     elif 55 <= fav_mid <= 72 and q_score >= 1:
-        result["verdict"] = "LIVE BET WATCH"
+        result["verdict"] = "WATCH THIS GAME LIVE"
         result["color"]   = "#3498db"
-        result["detail"]  = ("Close game " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + ". "
-                             + "Kalshi reprices in seconds, books take 30-90s after big runs." + thin_warning)
-        result["action_line"] = ("Both apps open. Fair: " + fav_name + " " + fav_fair
+        result["detail"]  = ("Close game: " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + " win chances. "
+                             + "This market updates in seconds during a run, while sportsbooks take 30–90 seconds to catch up." + thin_warning)
+        result["action_line"] = ("Keep both apps open. Fair odds right now: " + fav_name + " " + fav_fair
                                  + " / " + dog_name + " " + dog_fair + ". "
-                                 + "Bet whichever side the book lags on.")
+                                 + "Bet whichever team the sportsbook is slow to update.")
 
     elif 72 < fav_mid < 85:
-        result["verdict"] = "PRICE CHECK"
+        result["verdict"] = "CHECK THE ODDS"
         result["color"]   = "#f39c12"
-        result["detail"]  = (fav_name + " at " + str(int(fav_mid)) + "% (" + fav_fair + "). "
-                             + "Retail likely posts " + retail_fav_odds + ". Only bet if the book is generous." + thin_warning)
+        result["detail"]  = (fav_name + " has a " + str(int(fav_mid)) + "% win chance (" + fav_fair + "). "
+                             + "Sportsbooks will likely post " + retail_fav_odds + ". Only worth betting if the book is being generous." + thin_warning)
         result["action_line"] = (fav_name + " at " + fav_target + " or better — or — "
                                  + dog_name + " at " + dog_target + " or better. If neither, pass.")
 
     elif 45 <= fav_mid <= 55:
-        result["verdict"] = "TOSS-UP"
+        result["verdict"] = "COIN FLIP"
         result["color"]   = "#9b59b6"
-        result["detail"]  = ("Near even at " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + ". "
-                             + "Vig kills you on coin flips unless one side is mispriced." + thin_warning)
-        result["action_line"] = ("Fair: " + fav_name + " " + fav_fair + " / " + dog_name + " " + dog_fair + ". "
-                                 + "Bet whichever side the board gives you the biggest discount. If neither beats fair, skip.")
+        result["detail"]  = ("Almost 50/50: " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + " win chances. "
+                             + "The house cut eats your edge on coin flips unless one side is clearly mispriced." + thin_warning)
+        result["action_line"] = ("Fair odds: " + fav_name + " " + fav_fair + " / " + dog_name + " " + dog_fair + ". "
+                                 + "Bet whichever side the sportsbook is giving you the biggest discount on. If neither beats fair odds, skip.")
 
     elif 20 <= dog_mid <= 45 and q_score < 2:
-        result["verdict"] = "DOG - LOW CONF"
+        result["verdict"] = "UNDERDOG — LOW CONFIDENCE"
         result["color"]   = "#d4a017"
-        result["detail"]  = (dog_name + " at " + str(int(dog_mid)) + "% (" + dog_fair + ") but market is "
-                             + q_label.lower() + ". Mid could be off by 5+ cents.")
-        result["action_line"] = ("Half size only: " + dog_name + " at " + dog_target + " or better.")
+        result["detail"]  = (dog_name + " is at " + str(int(dog_mid)) + "% (" + dog_fair + ") but betting activity is "
+                             + QUALITY_LABELS.get(q_label, q_label).lower() + ". The price could be off by 5+ cents.")
+        result["action_line"] = ("Half your normal bet size only: " + dog_name + " at " + dog_target + " or better.")
 
     else:
         result["verdict"]     = "PASS"
         result["color"]       = "#666"
-        result["detail"]      = "No clear edge. " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + "."
+        result["detail"]      = "No clear edge here. Win chances: " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + "."
         result["action_line"] = "No action."
 
     return result
 
-# ── UI ─────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Kalshi MM", layout="wide")
+st.set_page_config(page_title="March Madness Betting Dashboard", layout="wide")
 st.markdown("""
 <style>
 .game-card {
@@ -929,10 +827,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Kalshi MM")
-st.caption("Last refresh: " + datetime.now().strftime("%I:%M:%S %p") + " · Auto-updates")
-
-# ── Sidebar ────────────────────────────────────────────────────────────────
+st.title("March Madness Betting Dashboard")
+st.caption("Last updated: " + datetime.now().strftime("%I:%M:%S %p") + " · Refreshes automatically")
 
 with st.sidebar:
     st.header("Settings")
@@ -940,48 +836,44 @@ with st.sidebar:
     if not api_key:
         api_key = st.text_input(
             "Kalshi API Key", type="password",
-            help="Paste here or set KALSHI_API_KEY in Streamlit secrets",
+            help="Paste your Kalshi API key here, or set KALSHI_API_KEY in Streamlit secrets",
         )
     else:
-        st.success("API key loaded")
+        st.success("API key loaded ✓")
 
     st.divider()
-    st.subheader("Refresh")
-    refresh_rate = st.slider("Refresh (sec)", 5, 120, 20, help="5-10 for live games, 30+ for pregame")
+    st.subheader("Auto-Refresh")
+    refresh_rate = st.slider("Update every (seconds)", 5, 120, 20, help="Use 5–10 during live games, 30+ before tip-off")
 
     st.divider()
-    st.subheader("Lag Alerts")
+    st.subheader("Odds Gap Alerts")
     lag_threshold = st.slider(
-        "Alert threshold (cents)", min_value=1, max_value=10, value=3,
-        help="Fire when Kalshi mid moves this many cents inside the lookback window",
+        "Alert when odds shift by (cents)", min_value=1, max_value=10, value=3,
+        help="Fires an alert when this market's price moves this many cents — your sportsbook may not have caught up yet",
     )
     lag_lookback = st.slider(
-        "Lookback window (sec)", min_value=30, max_value=300, value=90,
-        help="How far back to compare. 90s matches typical sportsbook reprice lag.",
+        "Look back how far (seconds)", min_value=30, max_value=300, value=90,
+        help="How far back to check for price movement. 90 seconds matches the typical sportsbook update delay.",
     )
 
     st.divider()
     st.markdown("""
-**Legend**
-- Green = actionable now
-- Yellow = only if price is right
-- Gray = skip
-- Target = minimum odds to bet
-- LAG ALERT = Kalshi moved; book may not have caught up
+**Color Guide**
+- 🟢 Green = Bet this now
+- 🟡 Yellow = Only if you get good enough odds
+- ⚫ Gray = Skip it
+- **Minimum Odds** = The worst odds you should accept before passing
+- **⚡ ODDS GAP ALERT** = This market moved fast — your sportsbook may be behind
 
-**Book Conviction Panel**
-- BIR = Book Imbalance Ratio (< 50% = dog pressure)
-- ENT = Shannon entropy (low = market agrees)
-- DEPTH = Fragility (high = price on a cliff)
+**Right Panel: What Bettors Are Doing**
+One sentence explaining whether the smart money agrees with the recommendation or not.
 """)
 
 if not api_key:
-    st.warning("Enter your Kalshi API key in the sidebar to start.")
+    st.warning("Enter your Kalshi API key in the sidebar to get started.")
     st.stop()
 
-# ── Fetch data ─────────────────────────────────────────────────────────────
-
-with st.spinner("Pulling Kalshi NCAA markets…"):
+with st.spinner("Loading March Madness markets…"):
     markets = fetch_ncaa_markets(api_key)
 
 espn_by_team, espn_raw = fetch_espn_games()
@@ -989,14 +881,12 @@ espn_by_team, espn_raw = fetch_espn_games()
 if espn_by_team:
     n_espn_live = sum(1 for g in espn_raw if g["status_state"] == "in")
     st.caption("ESPN: " + str(len(espn_raw)) + " games today"
-               + (" · 🔴 " + str(n_espn_live) + " live" if n_espn_live else ""))
-
-# ── Diagnostics ────────────────────────────────────────────────────────────
+               + (" · 🔴 " + str(n_espn_live) + " in progress" if n_espn_live else ""))
 
 if not markets:
-    st.warning("No NCAA markets found. Diagnostics below.")
+    st.warning("No markets found. Diagnostics below.")
 
-    with st.expander("Diagnostic - all open Kalshi events", expanded=True):
+    with st.expander("Diagnostic — all open Kalshi events", expanded=True):
         st.caption("Look for anything with KXNCAAMB in the ticker.")
         try:
             r = requests.get(
@@ -1012,7 +902,7 @@ if not markets:
                         use_container_width=True, hide_index=True,
                     )
                 else:
-                    st.error("API returned 0 events. API key may lack sports access, or Nevada geo-block.")
+                    st.error("API returned 0 events. Your API key may not have sports access, or you may be geo-blocked.")
             else:
                 st.error("API error " + str(r.status_code))
         except Exception as ex:
@@ -1034,14 +924,14 @@ if not markets:
                         sample[k] = raw_markets[0][k]
                 st.write("First market:", sample)
                 filtered = _filter_and_sort(raw_markets)
-                st.write("After time filter: " + str(len(filtered)))
+                st.write("After filter: " + str(len(filtered)))
                 if not filtered and raw_markets:
-                    st.warning("All markets filtered out by time window. Showing all anyway.")
+                    st.warning("All markets were filtered out. Showing all anyway.")
                     markets = raw_markets
         except Exception as ex:
             st.error("Direct fetch failed: " + str(ex))
 
-    st.subheader("Manual ticker search")
+    st.subheader("Search by ticker")
     c1, c2 = st.columns(2)
     with c1:
         manual_event = st.text_input("Event ticker")
@@ -1068,7 +958,6 @@ if not markets:
                 st.error("Not found")
 
 if markets:
-    # Group by game
     games = defaultdict(list)
     for m in markets:
         title         = (m.get("title", "") + m.get("subtitle", "")).lower()
@@ -1078,7 +967,6 @@ if markets:
         event = m.get("event_ticker", m.get("ticker", ""))
         games[event].append(m)
 
-    # Analyze each game
     analyses = []
     for event_ticker, gm in games.items():
         gm.sort(key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True)
@@ -1119,7 +1007,6 @@ if markets:
             lookback_seconds=float(lag_lookback),
         )
 
-        # ESPN enrichment
         fav_game, fav_team_data = espn_lookup(espn_by_team, fav_name)
         dog_game, dog_team_data = espn_lookup(espn_by_team, dog_name)
         espn_game   = fav_game or dog_game
@@ -1129,7 +1016,6 @@ if markets:
         espn_state  = espn_game["status_state"] if espn_game else None
         espn_sort_ts = espn_game["sort_ts"] if espn_game else None
 
-        # ── Book Conviction Scoring ──────────────────────────────
         ob_fav = fetch_orderbook(api_key, fav["ticker"])
         ob_dog = fetch_orderbook(api_key, dog["ticker"])
         conviction = compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid)
@@ -1163,12 +1049,12 @@ if markets:
         if lag.get("alert"):
             return 0
         v = g["a"]["verdict"]
-        if "DOG VALUE" in v:   return 1
-        if "LIVE BET"  in v:   return 2
-        if "TOSS"      in v:   return 3
-        if "PRICE"     in v:   return 4
-        if "CHALK"     in v:   return 5
-        if "LOW CONF"  in v:   return 6
+        if "UNDERDOG OPPORTUNITY" in v: return 1
+        if "WATCH THIS GAME"      in v: return 2
+        if "COIN FLIP"            in v: return 3
+        if "CHECK THE ODDS"       in v: return 4
+        if "BIG FAVORITE"         in v: return 5
+        if "LOW CONFIDENCE"       in v: return 6
         return 7
 
     for g in analyses:
@@ -1180,13 +1066,13 @@ if markets:
     ctrl_col, sort_col = st.columns([3, 1])
     with ctrl_col:
         FILTER_OPTS = {
-            "All":        lambda g: True,
-            "Lag":        lambda g: bool((g.get("lag_info") or {}).get("alert")),
-            "Actionable": lambda g: g["_priority"] <= 4,
-            "Dogs":       lambda g: "DOG" in g["a"]["verdict"],
-            "Live":       lambda g: g.get("espn_state") == "in",
-            "Next 3h":    lambda g: g["close_ts"] is not None and g["close_ts"] <= time.time() + 10800,
-            "Skip":       lambda g: g["_priority"] >= 7,
+            "All":            lambda g: True,
+            "Odds Gap ⚡":    lambda g: bool((g.get("lag_info") or {}).get("alert")),
+            "Bet These":      lambda g: g["_priority"] <= 4,
+            "Underdogs":      lambda g: "UNDERDOG" in g["a"]["verdict"],
+            "In Progress":    lambda g: g.get("espn_state") == "in",
+            "Next 3 Hours":   lambda g: g["close_ts"] is not None and g["close_ts"] <= time.time() + 10800,
+            "Skip":           lambda g: g["_priority"] >= 7,
         }
         filter_choice = st.radio(
             "Show", list(FILTER_OPTS.keys()), index=0,
@@ -1194,33 +1080,32 @@ if markets:
         )
     with sort_col:
         sort_choice = st.selectbox(
-            "Sort", ["Smart", "Start time", "Dog edge ↓", "Volume ↓", "Quality ↓", "Conviction ↓"],
+            "Sort by", ["Best first", "Start time", "Underdog edge ↓", "Most bets ↓", "Market quality ↓", "Smart money ↓"],
             label_visibility="collapsed",
         )
 
     shown = [g for g in analyses if FILTER_OPTS[filter_choice](g)]
 
-    if sort_choice == "Smart":
+    if sort_choice == "Best first":
         shown.sort(key=lambda g: g["_priority"])
     elif sort_choice == "Start time":
         shown.sort(key=lambda g: g["espn_sort_ts"] or g["close_ts"] or float("inf"))
-    elif sort_choice == "Dog edge ↓":
+    elif sort_choice == "Underdog edge ↓":
         shown.sort(key=lambda g: -g["a"].get("edge_dog_cents", 0))
-    elif sort_choice == "Volume ↓":
+    elif sort_choice == "Most bets ↓":
         shown.sort(key=lambda g: -g["vol"])
-    elif sort_choice == "Quality ↓":
+    elif sort_choice == "Market quality ↓":
         shown.sort(key=lambda g: -g["quality"][2])
-    elif sort_choice == "Conviction ↓":
+    elif sort_choice == "Smart money ↓":
         shown.sort(key=lambda g: -g["conviction"].get("confidence", 0))
 
     summary = str(len(shown)) + " of " + str(len(analyses)) + " games"
     if n_lag:
-        summary += " · " + str(n_lag) + " lag alert" + ("s" if n_lag > 1 else "")
+        summary += " · " + str(n_lag) + " odds gap alert" + ("s" if n_lag > 1 else "")
     if n_action:
-        summary += " · " + str(n_action) + " actionable"
+        summary += " · " + str(n_action) + " worth betting"
     st.caption(summary)
 
-    # ── Render cards ──────────────────────────────────────────────────────
     for g in shown:
         a          = g["a"]
         fm         = g["fav_mid"]
@@ -1237,11 +1122,11 @@ if markets:
         dog_seed_str = ("#" + str(g["dog_seed"]) + " ") if g["dog_seed"] else ""
 
         vig_val    = g["fav_m"].get("vig")
-        vig_str    = (str(round(vig_val, 1)) + "c vig") if vig_val else "—"
-        spread_str = (str(round(g["spread"], 1)) + "c sprd") if g["spread"] else "—"
-        vol_str    = "{:,.0f} vol".format(g["vol"])
+        vig_str    = (str(round(vig_val, 1)) + "¢ house cut") if vig_val else "—"
+        spread_str = (str(round(g["spread"], 1)) + "¢ buy/sell gap") if g["spread"] else "—"
+        vol_str    = "{:,.0f} total bets".format(g["vol"])
+        ql_human   = QUALITY_LABELS.get(ql, ql)
 
-        # Time display — ESPN score/tip-off takes priority over Kalshi close_time
         score_line = g.get("score_line")
         close_ts   = g.get("close_ts")
         if score_line:
@@ -1262,7 +1147,6 @@ if markets:
         else:
             time_html = ""
 
-        # Lag HTML
         lag      = g.get("lag_info") or {}
         lag_html = ""
         if lag:
@@ -1272,143 +1156,41 @@ if markets:
             if lag["alert"]:
                 lag_html = (
                     '<div class="lag-alert">'
-                    + '<strong>LAG ALERT</strong> — '
-                    + direction_name + " " + moved_str + "c in "
-                    + str(lag_lookback) + "s (" + vel_str + " c/min)"
-                    + " — check the board NOW"
+                    + '<strong>⚡ ODDS GAP ALERT</strong> — '
+                    + direction_name + " moved " + moved_str + "¢ in the last "
+                    + str(lag_lookback) + "s (" + vel_str + " ¢/min)"
+                    + " — check your sportsbook NOW"
                     + '</div>'
                 )
             else:
                 lag_html = (
                     '<div class="lag-neutral">'
-                    + "Δ " + moved_str + "¢ · " + vel_str + " ¢/min"
+                    + "Price moved " + moved_str + "¢ recently · " + vel_str + " ¢/min"
                     + '</div>'
                 )
 
         color    = a["color"]
         badge_bg = color + "22"
 
-        # ── Build conviction panel HTML ──────────────────────────────
         if conv["has_data"]:
-            bir_pct   = round(conv["bir"] * 100)
-            dog_pct   = 100 - bir_pct
-            ent_val   = conv["entropy"]
-            depth_val = conv["depth_grad"]
-            conf_val  = conv["confidence"]
-            adj_prob  = conv["adjusted_prob"]
-            signal    = conv["signal"]
-            strength  = conv["strength"]
-
-            # Colors for signal
-            if signal == "DOG":
-                sig_color = "#ff8a65"
-                sig_bg    = "#ff8a6518"
-            elif signal == "FAV":
-                sig_color = "#4fc3f7"
-                sig_bg    = "#4fc3f718"
-            else:
-                sig_color = "#888"
-                sig_bg    = "#88888818"
-
-            # Strength colors
-            str_colors = {"STRONG": "#2ecc71", "MODERATE": "#f1c40f", "WEAK": "#e67e22", "NOISE": "#666"}
-            str_color  = str_colors.get(strength, "#666")
-
-            # BIR bar: show fav% on left (blue), dog% on right (orange)
-            bir_bar = (
-                '<div class="conv-bar-track">'
-                + '<div class="conv-bar-fill" style="width:' + str(bir_pct) + '%;background:linear-gradient(90deg,#4fc3f7,' + ('#4fc3f7' if bir_pct > 50 else '#ff8a65') + ');"></div>'
-                + '</div>'
-            )
-
-            # Entropy bar: low = green (good), high = red (bad)
-            ent_pct = round(ent_val * 100)
-            ent_color = "#2ecc71" if ent_val < 0.4 else "#f1c40f" if ent_val < 0.7 else "#e74c3c"
-            ent_bar = (
-                '<div class="conv-bar-track">'
-                + '<div class="conv-bar-fill" style="width:' + str(ent_pct) + '%;background:' + ent_color + ';"></div>'
-                + '</div>'
-            )
-
-            # Depth bar: high = red (fragile), low = green (stable)
-            dep_pct = round(depth_val * 100)
-            dep_color = "#e74c3c" if depth_val > 0.7 else "#f1c40f" if depth_val > 0.4 else "#2ecc71"
-            dep_bar = (
-                '<div class="conv-bar-track">'
-                + '<div class="conv-bar-fill" style="width:' + str(dep_pct) + '%;background:' + dep_color + ';"></div>'
-                + '</div>'
-            )
-
-            # Adjusted prob with American odds
-            adj_odds = prob_to_american(adj_prob)
-            mid_odds = prob_to_american(dm)
-            delta    = round(adj_prob - dm, 1)
-            delta_str = ("+" if delta > 0 else "") + str(delta)
-            delta_color = "#2ecc71" if delta > 0 else "#e74c3c" if delta < 0 else "#888"
-
+            narrative_text = conv["narrative"]
             conv_html = (
-                '<div class="conv-panel">'
-                + '<div class="conv-header">BOOK CONVICTION</div>'
-
-                # Signal + Strength badges
-                + '<div style="display:flex;gap:4px;margin-bottom:4px;">'
-                + '<span class="conv-badge" style="color:' + sig_color + ';background:' + sig_bg + ';">' + signal + '</span>'
-                + '<span class="conv-badge" style="color:' + str_color + ';background:' + str_color + '18;">' + strength + '</span>'
+                '<div class="conv-panel" style="justify-content:center;">'
+                + '<div class="conv-header">WHAT BETTORS ARE DOING</div>'
+                + '<div style="font-size:0.95em;color:#ccc;line-height:1.6;padding:8px 0;">'
+                + narrative_text
                 + '</div>'
-
-                # BIR
-                + '<div class="conv-signal-row">'
-                + '<span class="conv-label">BIR (imbalance)</span>'
-                + '<span class="conv-value" style="color:#4fc3f7;">' + str(bir_pct) + 'F</span>'
-                + '</div>'
-                + bir_bar
-
-                # Entropy
-                + '<div class="conv-signal-row">'
-                + '<span class="conv-label">ENT (agreement)</span>'
-                + '<span class="conv-value" style="color:' + ent_color + ';">' + str(round(ent_val, 2)) + '</span>'
-                + '</div>'
-                + ent_bar
-
-                # Depth
-                + '<div class="conv-signal-row">'
-                + '<span class="conv-label">DEPTH (fragility)</span>'
-                + '<span class="conv-value" style="color:' + dep_color + ';">' + str(round(depth_val, 2)) + '</span>'
-                + '</div>'
-                + dep_bar
-
-                # Confidence
-                + '<div class="conv-signal-row" style="margin-top:2px;">'
-                + '<span class="conv-label">Confidence</span>'
-                + '<span class="conv-value" style="color:' + str_color + ';">' + str(round(conf_val, 2)) + '</span>'
-                + '</div>'
-
-                # Adjusted probability
-                + '<div class="conv-prob-row">'
-                + '<div>'
-                + '<div class="conv-prob-label">Dog adj. prob</div>'
-                + '<div class="conv-prob-value" style="color:' + sig_color + ';">' + str(adj_prob) + '%</div>'
-                + '</div>'
-                + '<div style="text-align:right;">'
-                + '<div class="conv-prob-label">' + adj_odds + '</div>'
-                + '<div style="font-size:0.72em;color:' + delta_color + ';font-weight:700;">Δ ' + delta_str + '</div>'
-                + '</div>'
-                + '</div>'
-
-                # Narrative
-                + '<div class="conv-narrative">' + conv["narrative"] + '</div>'
                 + '</div>'
             )
-        else:
+        elif not conv["has_data"]:
             conv_html = (
-                '<div class="conv-panel">'
-                + '<div class="conv-header">BOOK CONVICTION</div>'
-                + '<div class="conv-nodata">No order book data</div>'
-                + '<div style="font-size:0.55em;color:#333;word-break:break-all;padding:4px;">' + conv.get("debug", "") + '</div>'
+                '<div class="conv-panel" style="justify-content:center;">'
+                + '<div class="conv-header">WHAT BETTORS ARE DOING</div>'
+                + '<div class="conv-nodata">Not enough data yet.</div>'
                 + '</div>'
             )
 
-        # ── Build main card HTML (left side) ─────────────────────────
+
         main_html = (
             '<div class="game-main">'
             + '<div class="act-box" style="border-left-color:' + color + ';margin-bottom:10px;">'
@@ -1425,20 +1207,20 @@ if markets:
             + '<div class="team-cell">'
             + '<div class="team-label">Favorite</div>'
             + '<div class="team-name">' + fav_seed_str + g["fav_name"] + '</div>'
-            + '<div class="team-price" style="color:#4fc3f7;">' + str(int(fm)) + 'c · ' + fav_fair + '</div>'
-            + '<div class="team-target" style="color:#4fc3f7;">Target: ' + fav_target + '</div>'
+            + '<div class="team-price" style="color:#4fc3f7;">' + str(int(fm)) + '¢ · ' + fav_fair + '</div>'
+            + '<div class="team-target" style="color:#4fc3f7;">Minimum odds: ' + fav_target + '</div>'
             + '</div>'
             + '<div class="team-cell">'
-            + '<div class="team-label">Dog</div>'
+            + '<div class="team-label">Underdog</div>'
             + '<div class="team-name">' + dog_seed_str + g["dog_name"] + '</div>'
-            + '<div class="team-price" style="color:#ff8a65;">' + str(int(dm)) + 'c · ' + dog_fair + '</div>'
-            + '<div class="team-target" style="color:#ff8a65;">Target: ' + dog_target + '</div>'
+            + '<div class="team-price" style="color:#ff8a65;">' + str(int(dm)) + '¢ · ' + dog_fair + '</div>'
+            + '<div class="team-target" style="color:#ff8a65;">Minimum odds: ' + dog_target + '</div>'
             + '</div>'
             + '</div>'
             + '<div class="mkt-strip">'
             + time_html
             + '<span class="mkt-item" style="color:#444;">|</span>'
-            + '<span class="mkt-item"><span>' + ql + '</span></span>'
+            + '<span class="mkt-item"><span>' + ql_human + '</span></span>'
             + '<span class="mkt-item">' + spread_str + '</span>'
             + '<span class="mkt-item">' + vig_str + '</span>'
             + '<span class="mkt-item">' + vol_str + '</span>'
@@ -1447,7 +1229,6 @@ if markets:
             + '</div>'
         )
 
-        # ── Combine into row layout ──────────────────────────────────
         card = (
             '<div class="game-row">'
             + main_html
@@ -1457,7 +1238,6 @@ if markets:
 
         st.markdown(card, unsafe_allow_html=True)
 
-    # Order book viewer
     with st.expander("Order Book Depth"):
         ticker_opts = {}
         for g in analyses:
@@ -1484,37 +1264,34 @@ if markets:
                     else:
                         st.caption("Empty")
 
-    # Quick reference table
-    with st.expander("Quick Reference - All Games"):
+    with st.expander("Quick Reference — All Games"):
         rows = []
         for g in analyses:
             a    = g["a"]
             lag  = g.get("lag_info") or {}
             conv = g.get("conviction", {})
             rows.append({
-                "Game":          g["title"],
-                "Verdict":       a["verdict"],
-                "Tip-off":       g.get("score_line") or "—",
-                "Fav":           (("#" + str(g["fav_seed"]) + " ") if g["fav_seed"] else "") + g["fav_name"],
-                "Fav c":         str(int(g["fav_mid"])),
-                "Fav Fair":      prob_to_american(g["fav_mid"]),
-                "Fav Target":    a["fav_target"],
-                "Dog":           (("#" + str(g["dog_seed"]) + " ") if g["dog_seed"] else "") + g["dog_name"],
-                "Dog c":         str(int(g["dog_mid"])),
-                "Dog Fair":      prob_to_american(g["dog_mid"]),
-                "Dog Target":    a["dog_target"],
-                "Quality":       g["quality"][0],
-                "BIR":           str(round(conv.get("bir", 0.5) * 100)) + "F" if conv.get("has_data") else "—",
-                "Entropy":       str(round(conv.get("entropy", 1.0), 2)) if conv.get("has_data") else "—",
-                "Signal":        conv.get("signal", "—") + "/" + conv.get("strength", "—") if conv.get("has_data") else "—",
-                "Adj Dog%":      str(conv.get("adjusted_prob", "—")) if conv.get("has_data") else "—",
-                "Lag":           (str(lag.get("moved_cents", "")) + "c") if lag else "—",
-                "Alert":         "YES" if lag.get("alert") else "—",
+                "Game":              g["title"],
+                "Verdict":           a["verdict"],
+                "Tip-off":           g.get("score_line") or "—",
+                "Favorite":          (("#" + str(g["fav_seed"]) + " ") if g["fav_seed"] else "") + g["fav_name"],
+                "Fav win %":         str(int(g["fav_mid"])) + "%",
+                "Fav odds":          prob_to_american(g["fav_mid"]),
+                "Fav min. odds":     a["fav_target"],
+                "Underdog":          (("#" + str(g["dog_seed"]) + " ") if g["dog_seed"] else "") + g["dog_name"],
+                "Dog win %":         str(int(g["dog_mid"])) + "%",
+                "Dog odds":          prob_to_american(g["dog_mid"]),
+                "Dog min. odds":     a["dog_target"],
+                "Market":            QUALITY_LABELS.get(g["quality"][0], g["quality"][0]),
+                "Money on fav":      str(round(conv.get("bir", 0.5) * 100)) + "%" if conv.get("has_data") else "—",
+                "Bettor agreement":  str(round(conv.get("entropy", 1.0), 2)) if conv.get("has_data") else "—",
+                "Lean":              conv.get("signal", "—") + " / " + conv.get("strength", "—") if conv.get("has_data") else "—",
+                "True underdog %":   str(conv.get("adjusted_prob", "—")) + "%" if conv.get("has_data") else "—",
+                "Price moved":       (str(lag.get("moved_cents", "")) + "¢") if lag else "—",
+                "Odds gap alert":    "YES ⚡" if lag.get("alert") else "—",
             })
         if rows:
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-# ── Auto-refresh ───────────────────────────────────────────────────────────
 
 st.divider()
 c1, c2 = st.columns([3, 1])
@@ -1523,7 +1300,7 @@ with c2:
         st.cache_data.clear()
         st.rerun()
 with c1:
-    st.caption("Auto-refresh in " + str(refresh_rate) + "s")
+    st.caption("Next auto-refresh in " + str(refresh_rate) + " seconds")
 
 time.sleep(refresh_rate)
 st.cache_data.clear()
