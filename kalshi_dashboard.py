@@ -660,7 +660,15 @@ if markets:
 
         game_title = fav.get("title", event_ticker).replace(" Winner?", "").replace(" winner?", "").strip()
 
-        # FIX #1: Record price snapshot and compute lag on every render cycle
+        # Parse close_time for sort/filter by start time
+        close_ts = None
+        close_str = fav.get("close_time") or fav.get("expected_expiration_time") or ""
+        if close_str:
+            try:
+                close_ts = datetime.fromisoformat(close_str.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+
         record_price(fav["ticker"], fav_mid)
         lag_info = compute_live_lag(
             fav["ticker"], fav_mid,
@@ -682,7 +690,8 @@ if markets:
             "vol":          total_vol,
             "a":            a,
             "quality":      market_quality(spread, total_vol),
-            "lag_info":     lag_info,   # FIX #1
+            "lag_info":     lag_info,
+            "close_ts":     close_ts,
         })
 
     # ── Verdict priority score (used by Smart sort and filter) ────────────────
@@ -714,6 +723,7 @@ if markets:
             "Actionable": lambda g: g["_priority"] <= 4,
             "Dogs":       lambda g: "DOG" in g["a"]["verdict"],
             "Live":       lambda g: "LIVE" in g["a"]["verdict"],
+            "Next 3h":    lambda g: g["close_ts"] is not None and g["close_ts"] <= time.time() + 10800,
             "Skip":       lambda g: g["_priority"] >= 7,
         }
         filter_choice = st.radio(
@@ -726,7 +736,7 @@ if markets:
     with sort_col:
         sort_choice = st.selectbox(
             "Sort",
-            ["Smart", "Dog edge ↓", "Volume ↓", "Quality ↓"],
+            ["Smart", "Start time", "Dog edge ↓", "Volume ↓", "Quality ↓"],
             label_visibility="collapsed",
         )
 
@@ -736,6 +746,8 @@ if markets:
     # Apply sort
     if sort_choice == "Smart":
         shown.sort(key=lambda g: g["_priority"])
+    elif sort_choice == "Start time":
+        shown.sort(key=lambda g: g["close_ts"] or float("inf"))
     elif sort_choice == "Dog edge ↓":
         shown.sort(key=lambda g: -g["a"].get("edge_dog_cents", 0))
     elif sort_choice == "Volume ↓":
@@ -765,9 +777,23 @@ if markets:
         dog_target = a["dog_target"]
 
         vig_val    = g["fav_m"].get("vig")
-        vig_str    = (str(round(vig_val, 1)) + "¢ vig") if vig_val else "—"
-        spread_str = (str(round(g["spread"], 1)) + "¢ sprd") if g["spread"] else "—"
+        vig_str    = (str(round(vig_val, 1)) + "c vig") if vig_val else "—"
+        spread_str = (str(round(g["spread"], 1)) + "c sprd") if g["spread"] else "—"
         vol_str    = "{:,.0f} vol".format(g["vol"])
+
+        close_ts = g.get("close_ts")
+        if close_ts:
+            mins_away = int((close_ts - time.time()) / 60)
+            if mins_away < 0:
+                time_str = "live/closed"
+            elif mins_away < 60:
+                time_str = str(mins_away) + "m"
+            elif mins_away < 1440:
+                time_str = datetime.fromtimestamp(close_ts).strftime("%-I:%M %p")
+            else:
+                time_str = datetime.fromtimestamp(close_ts).strftime("%b %-d %-I:%M %p")
+        else:
+            time_str = None
 
         # ── FIX #1: lag HTML ──────────────────────────────────────────
         lag      = g.get("lag_info") or {}
@@ -824,6 +850,7 @@ if markets:
             + '</div>'
             + '</div>'
             + '<div class="mkt-strip">'
+            + ('<span class="mkt-item">' + time_str + '</span>' if time_str else '')
             + '<span class="mkt-item"><span>' + ql + '</span></span>'
             + '<span class="mkt-item">' + spread_str + '</span>'
             + '<span class="mkt-item">' + vig_str + '</span>'
