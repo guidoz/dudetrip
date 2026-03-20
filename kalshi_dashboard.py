@@ -792,6 +792,10 @@ if markets:
                     + '</div>'
                 )
 
+        color     = a["color"]
+        badge_bg  = color + "22"
+        badge_bdr = color
+
         # ── Assemble card ─────────────────────────────────────────────
         card = (
             '<div class="game-card">'
