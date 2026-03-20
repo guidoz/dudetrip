@@ -351,26 +351,50 @@ def market_quality(spread, volume):
 
 # ── Book Conviction Scoring ────────────────────────────────────────────────
 
-def _extract_levels(orderbook, side, direction):
+def _extract_levels(orderbook, side):
     """
     Extract list of (price_cents, quantity) from the orderbook.
-    side = 'yes' or 'no'
-    direction = 'bids' or 'asks'  (Kalshi only returns bids per side)
+    Handles multiple Kalshi orderbook_fp formats:
+      - {"yes": {"bids": [[p,q], ...]}}       (nested with bids key)
+      - {"yes": [[p,q], ...]}                  (flat list)
+      - {"yes": [{"price":p, "quantity":q}]}   (list of dicts)
     """
     levels = []
     try:
-        raw = orderbook.get(side, {}).get(direction, [])
+        side_data = orderbook.get(side, {})
+        if side_data is None:
+            return levels
+
+        # If side_data is a list directly: [entries...]
+        if isinstance(side_data, list):
+            raw = side_data
+        elif isinstance(side_data, dict):
+            # Try common sub-keys: bids, asks, or just take all list values
+            raw = side_data.get("bids", [])
+            if not raw:
+                raw = side_data.get("asks", [])
+            if not raw:
+                # Maybe the dict values are themselves lists of levels
+                for v in side_data.values():
+                    if isinstance(v, list) and v:
+                        raw = v
+                        break
+        else:
+            return levels
+
         for entry in raw:
-            # Kalshi orderbook_fp entries: [price_cents, quantity] or dict
-            if isinstance(entry, (list, tuple)):
+            price = 0
+            qty   = 0
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
                 price = float(entry[0])
                 qty   = float(entry[1])
             elif isinstance(entry, dict):
-                price = float(entry.get("price", 0))
-                qty   = float(entry.get("quantity", 0))
+                # Try multiple possible key names
+                price = float(entry.get("price", 0) or entry.get("price_cents", 0) or 0)
+                qty   = float(entry.get("quantity", 0) or entry.get("count", 0) or entry.get("size", 0) or 0)
             else:
                 continue
-            if qty > 0:
+            if qty > 0 and price > 0:
                 levels.append((price, qty))
     except Exception:
         pass
@@ -395,18 +419,40 @@ def compute_book_conviction(ob_fav, ob_dog, fav_mid, dog_mid):
         "bir": 0.5, "entropy": 1.0, "depth_grad": 0.5,
         "confidence": 0.0, "adjusted_prob": dog_mid,
         "narrative": "No order book data.", "signal": "NEUTRAL",
-        "strength": "NOISE", "has_data": False,
+        "strength": "NOISE", "has_data": False, "debug": "",
     }
+
+    # Debug: capture the structure of what we got
+    def _describe_ob(ob):
+        if not ob:
+            return "empty"
+        parts = []
+        for k, v in ob.items():
+            if isinstance(v, list):
+                parts.append(k + ":[" + str(len(v)) + " items]")
+                if v:
+                    parts.append("  sample:" + str(v[0])[:80])
+            elif isinstance(v, dict):
+                sub_keys = list(v.keys())
+                parts.append(k + ":{" + ",".join(sub_keys) + "}")
+                for sk, sv in v.items():
+                    if isinstance(sv, list) and sv:
+                        parts.append("  " + sk + ":[" + str(len(sv)) + "] sample:" + str(sv[0])[:80])
+            else:
+                parts.append(k + ":" + str(v)[:40])
+        return " | ".join(parts)
+
+    result["debug"] = "fav_ob=" + _describe_ob(ob_fav) + " /// dog_ob=" + _describe_ob(ob_dog)
 
     # Collect all order levels from both books
     # YES bids on fav = money backing the favorite
     # YES bids on dog = money backing the dog
     # NO bids on fav  = also money backing the dog (betting against fav)
     # NO bids on dog  = also money backing the fav (betting against dog)
-    fav_yes_bids = _extract_levels(ob_fav, "yes", "bids")
-    fav_no_bids  = _extract_levels(ob_fav, "no",  "bids")
-    dog_yes_bids = _extract_levels(ob_dog, "yes", "bids")
-    dog_no_bids  = _extract_levels(ob_dog, "no",  "bids")
+    fav_yes_bids = _extract_levels(ob_fav, "yes")
+    fav_no_bids  = _extract_levels(ob_fav, "no")
+    dog_yes_bids = _extract_levels(ob_dog, "yes")
+    dog_no_bids  = _extract_levels(ob_dog, "no")
 
     # All levels combined for entropy calculation
     all_levels = fav_yes_bids + fav_no_bids + dog_yes_bids + dog_no_bids
@@ -1351,6 +1397,7 @@ if markets:
                 '<div class="conv-panel">'
                 + '<div class="conv-header">BOOK CONVICTION</div>'
                 + '<div class="conv-nodata">No order book data</div>'
+                + '<div style="font-size:0.55em;color:#333;word-break:break-all;padding:4px;">' + conv.get("debug", "") + '</div>'
                 + '</div>'
             )
 
