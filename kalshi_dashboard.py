@@ -1,62 +1,35 @@
 """
-March Madness Kalshi Live Dashboard  —  v2 "El Cortez Edition"
-───────────────────────────────────────────────────────────────
-Streamlit app — deploy free at streamlit.io/cloud
+March Madness Kalshi Live Dashboard v2
+--------------------------------------
+Streamlit app. Deploy free at streamlit.io/cloud.
+Set KALSHI_API_KEY in Streamlit Cloud > App Settings > Secrets.
 
-What's new in v2:
-  • Fixed vig double-counting bug
-  • "AT THE WINDOW" card: exact moneyline thresholds to look for in person
-  • Kelly criterion bet sizing per game
-  • March Madness seed upset base rates as sanity check
-  • Smarter market pairing (filters for Winner markets)
-  • 10-second refresh when live games are active
-  • Bankroll tracker in sidebar
-
-Setup:
-  pip install streamlit requests pandas
-  streamlit run kalshi_dashboard.py
-
-Set your KALSHI_API_KEY in Streamlit Cloud > App Settings > Secrets.
+pip install streamlit requests pandas
+streamlit run kalshi_dashboard.py
 """
 
 import streamlit as st
 import requests
 import pandas as pd
 import time
-import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
-
-# ── Config ─────────────────────────────────────────────────────────────────
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Historical March Madness upset rates by seed matchup (1985–2024)
-# Source: NCAA tournament historical data
-# Key = (higher_seed, lower_seed), Value = underdog win %
+# Historical NCAA Tournament upset rates by seed matchup (1985-2024)
 SEED_UPSET_RATES = {
-    (1, 16): 0.02,   # 1 upset in ~160 games (UMBC, FDU)
-    (2, 15): 0.06,   # ~10 upsets total
-    (3, 14): 0.13,
-    (4, 13): 0.21,
-    (5, 12): 0.35,   # the famous 12-over-5
-    (6, 11): 0.37,
-    (7, 10): 0.39,
-    (8, 9):  0.49,   # near coin flip
-}
-
-# Common team-to-seed mapping for 2026 tournament (update each year)
-# This is a fallback — ideally we'd pull from Kalshi market metadata
-# Leave empty and it won't crash, just won't show seed context
-TEAM_SEEDS_2026 = {
-    # Update these with actual 2026 bracket seeds
-    # "DUKE": 1, "HOUSTON": 1, "AUBURN": 1, "FLORIDA": 1,
-    # "MICHIGAN": 2, "TENN": 2, ...
-    # "HOWARD": 16, "AMER": 16, ...
+    (1, 16): 2,  (2, 15): 6,  (3, 14): 7,  (4, 13): 21,
+    (5, 12): 35, (6, 11): 37, (7, 10): 39, (8, 9): 48,
+    (1, 8): 21, (1, 9): 17, (2, 7): 27, (2, 10): 22,
+    (3, 6): 34, (3, 11): 28, (4, 5): 43,
+    (1, 4): 30, (1, 5): 25, (1, 3): 28,
+    (2, 3): 42, (1, 2): 38,
 }
 
 
-# ── Kalshi API helpers ──────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────
+
 
 def get_api_key():
     try:
@@ -66,151 +39,187 @@ def get_api_key():
 
 
 def kalshi_headers(api_key):
-    return {
-        "accept": "application/json",
-        "KALSHI-ACCESS-KEY": api_key,
-    }
+    return {"accept": "application/json", "KALSHI-ACCESS-KEY": api_key}
 
 
-def fetch_ncaa_markets(api_key, ttl_seconds=30):
-    """Fetch NCAA basketball markets with configurable TTL."""
+def prob_to_american(prob):
+    if prob <= 0 or prob >= 100:
+        return "N/A"
+    if prob >= 50:
+        return "-" + str(int(round(prob / (100 - prob) * 100)))
+    else:
+        return "+" + str(int(round((100 - prob) / prob * 100)))
 
-    @st.cache_data(ttl=ttl_seconds)
-    def _fetch(api_key_inner):
-        NCAA_KEYWORDS = [
-            "ncaa", "march madness", "basketball", "ncaab", "ncaamb",
-            "college basketball", "tournament", "kxncaamb",
-        ]
-        all_markets = []
-        seen_tickers = set()
 
-        # ── Strategy 1: confirmed series ticker ──
-        CANDIDATE_SERIES = [
-            "KXNCAAMBGAME",
-            "KXNCAAMB", "KXNCAAB", "KXMARCHMADNESS", "KXCBB",
-        ]
-        for series in CANDIDATE_SERIES:
-            try:
-                r = requests.get(
-                    f"{BASE_URL}/markets",
-                    params={"series_ticker": series, "status": "open", "limit": 200},
-                    headers=kalshi_headers(api_key_inner),
-                    timeout=8,
-                )
-                if r.status_code == 200:
-                    for m in r.json().get("markets", []):
-                        if m["ticker"] not in seen_tickers:
-                            seen_tickers.add(m["ticker"])
-                            all_markets.append(m)
-            except Exception:
-                pass
-        if all_markets:
-            return _filter_today(all_markets)
+def kelly_fraction(true_prob, book_implied_prob):
+    """Quarter-Kelly fraction. Both inputs on 0-100 scale."""
+    if true_prob <= 0 or book_implied_prob <= 0:
+        return 0.0
+    if true_prob >= 100 or book_implied_prob >= 100:
+        return 0.0
+    p = true_prob / 100
+    q = 1 - p
+    b = (100 / book_implied_prob) - 1
+    if b <= 0:
+        return 0.0
+    f = (b * p - q) / b
+    return max(0.0, f)
 
-        # ── Strategy 1b: events endpoint with nested markets ──
-        try:
-            r = requests.get(
-                f"{BASE_URL}/events",
-                params={
-                    "series_ticker": "KXNCAAMBGAME",
-                    "status": "open", "limit": 200,
-                    "with_nested_markets": "true",
-                },
-                headers=kalshi_headers(api_key_inner),
-                timeout=10,
-            )
-            if r.status_code == 200:
-                for event in r.json().get("events", []):
-                    for m in event.get("markets", []):
-                        if m["ticker"] not in seen_tickers:
-                            seen_tickers.add(m["ticker"])
-                            all_markets.append(m)
-            if all_markets:
-                return _filter_today(all_markets)
-        except Exception:
-            pass
 
-        # ── Strategy 2: paginate open events, keyword filter ──
-        cursor = None
-        pages = 0
-        while pages < 10:
-            params = {"status": "open", "limit": 200, "with_nested_markets": "true"}
-            if cursor:
-                params["cursor"] = cursor
-            try:
-                r = requests.get(
-                    f"{BASE_URL}/events", params=params,
-                    headers=kalshi_headers(api_key_inner), timeout=10,
-                )
-                if r.status_code != 200:
-                    break
-                data = r.json()
-                events = data.get("events", [])
-                for event in events:
-                    title = " ".join([
-                        event.get("title", ""),
-                        event.get("sub_title", ""),
-                        event.get("series_ticker", ""),
-                    ]).lower()
-                    if any(kw in title for kw in NCAA_KEYWORDS):
-                        for m in event.get("markets", []):
-                            if m["ticker"] not in seen_tickers:
-                                seen_tickers.add(m["ticker"])
-                                all_markets.append(m)
-                cursor = data.get("cursor")
-                if not cursor or not events:
-                    break
-                pages += 1
-            except Exception:
-                break
+def estimate_retail_implied(kalshi_mid):
+    """Estimate what a retail book charges vs Kalshi fair price."""
+    vig_rate = 0.045
+    if kalshi_mid >= 50:
+        return min(kalshi_mid + (kalshi_mid * vig_rate), 97)
+    else:
+        return max(kalshi_mid - (kalshi_mid * vig_rate * 0.7), 2)
 
-        # ── Strategy 3: broad scan ──
-        if not all_markets:
-            try:
-                r = requests.get(
-                    f"{BASE_URL}/markets",
-                    params={"status": "open", "limit": 1000},
-                    headers=kalshi_headers(api_key_inner), timeout=10,
-                )
-                if r.status_code == 200:
-                    for m in r.json().get("markets", []):
-                        title = (m.get("title", "") + " " + m.get("ticker", "")).lower()
-                        if any(kw in title for kw in NCAA_KEYWORDS):
-                            if m["ticker"] not in seen_tickers:
-                                seen_tickers.add(m["ticker"])
-                                all_markets.append(m)
-            except Exception:
-                pass
 
-        return _filter_today(all_markets)
+def value_target(kalshi_mid, min_edge_pct=2.0):
+    """Minimum American odds to have +EV at the window."""
+    if kalshi_mid <= 0 or kalshi_mid >= 100:
+        return "N/A"
+    target_implied = kalshi_mid - min_edge_pct
+    if target_implied <= 0:
+        target_implied = 1
+    if target_implied >= 100:
+        target_implied = 99
+    return prob_to_american(target_implied)
 
-    return _fetch(api_key)
+
+# ── Time filter ────────────────────────────────────────────────────────────
 
 
 def _filter_today(markets):
-    """Keep only markets closing within a reasonable window of now."""
+    """Keep markets in a wide window. If filter removes everything, return all."""
     now = datetime.now(timezone.utc)
 
-    def is_relevant(m):
+    def ok(m):
         close = m.get("close_time") or m.get("expiration_time") or ""
         if not close:
             return True
         try:
             ct = datetime.fromisoformat(close.replace("Z", "+00:00"))
-            hours_diff = (ct - now).total_seconds() / 3600
-            # -3h (just finished) to +14h (tonight's late games Pacific time)
-            return -3 <= hours_diff <= 14
+            hrs = (ct - now).total_seconds() / 3600
+            return -6 <= hrs <= 36
         except Exception:
             return True
 
-    return [m for m in markets if is_relevant(m)]
+    filtered = [m for m in markets if ok(m)]
+    return filtered if filtered else markets
+
+
+# ── API fetchers ───────────────────────────────────────────────────────────
+
+
+@st.cache_data(ttl=15)
+def fetch_ncaa_markets(api_key):
+    NCAA_KEYWORDS = [
+        "ncaa", "march madness", "basketball", "ncaab", "ncaamb",
+        "college basketball", "tournament", "kxncaamb",
+    ]
+    all_markets = []
+    seen = set()
+
+    # Strategy 1: confirmed series tickers (no status filter so settled games show too)
+    for series in ["KXNCAAMBGAME", "KXNCAAMB", "KXNCAAB", "KXMARCHMADNESS", "KXCBB"]:
+        try:
+            r = requests.get(
+                BASE_URL + "/markets",
+                params={"series_ticker": series, "limit": 200},
+                headers=kalshi_headers(api_key), timeout=8,
+            )
+            if r.status_code == 200:
+                for m in r.json().get("markets", []):
+                    if m["ticker"] not in seen:
+                        seen.add(m["ticker"])
+                        all_markets.append(m)
+        except Exception:
+            pass
+    if all_markets:
+        return _filter_today(all_markets)
+
+    # Strategy 1b: events endpoint with nested markets
+    try:
+        r = requests.get(
+            BASE_URL + "/events",
+            params={
+                "series_ticker": "KXNCAAMBGAME", "status": "open",
+                "limit": 200, "with_nested_markets": "true",
+            },
+            headers=kalshi_headers(api_key), timeout=10,
+        )
+        if r.status_code == 200:
+            for event in r.json().get("events", []):
+                for m in event.get("markets", []):
+                    if m["ticker"] not in seen:
+                        seen.add(m["ticker"])
+                        all_markets.append(m)
+        if all_markets:
+            return _filter_today(all_markets)
+    except Exception:
+        pass
+
+    # Strategy 2: paginate all open events, keyword filter
+    cursor = None
+    for _ in range(10):
+        params = {"status": "open", "limit": 200, "with_nested_markets": "true"}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r = requests.get(
+                BASE_URL + "/events", params=params,
+                headers=kalshi_headers(api_key), timeout=10,
+            )
+            if r.status_code != 200:
+                break
+            data = r.json()
+            events = data.get("events", [])
+            for event in events:
+                title = " ".join([
+                    event.get("title", ""),
+                    event.get("sub_title", ""),
+                    event.get("series_ticker", ""),
+                ]).lower()
+                if any(kw in title for kw in NCAA_KEYWORDS):
+                    for m in event.get("markets", []):
+                        if m["ticker"] not in seen:
+                            seen.add(m["ticker"])
+                            all_markets.append(m)
+            cursor = data.get("cursor")
+            if not cursor or not events:
+                break
+        except Exception:
+            break
+
+    # Strategy 3: broad market scan
+    if not all_markets:
+        try:
+            r = requests.get(
+                BASE_URL + "/markets",
+                params={"status": "open", "limit": 1000},
+                headers=kalshi_headers(api_key), timeout=10,
+            )
+            if r.status_code == 200:
+                for m in r.json().get("markets", []):
+                    title = (m.get("title", "") + " " + m.get("ticker", "")).lower()
+                    if any(kw in title for kw in NCAA_KEYWORDS):
+                        if m["ticker"] not in seen:
+                            seen.add(m["ticker"])
+                            all_markets.append(m)
+        except Exception:
+            pass
+
+    return _filter_today(all_markets)
 
 
 @st.cache_data(ttl=10)
 def fetch_orderbook(api_key, ticker):
-    url = f"{BASE_URL}/markets/{ticker}/orderbook"
     try:
-        r = requests.get(url, headers=kalshi_headers(api_key), timeout=8)
+        r = requests.get(
+            BASE_URL + "/markets/" + ticker + "/orderbook",
+            headers=kalshi_headers(api_key), timeout=8,
+        )
         if r.status_code == 200:
             return r.json().get("orderbook_fp", {})
     except Exception:
@@ -220,9 +229,11 @@ def fetch_orderbook(api_key, ticker):
 
 @st.cache_data(ttl=10)
 def fetch_market_detail(api_key, ticker):
-    url = f"{BASE_URL}/markets/{ticker}"
     try:
-        r = requests.get(url, headers=kalshi_headers(api_key), timeout=8)
+        r = requests.get(
+            BASE_URL + "/markets/" + ticker,
+            headers=kalshi_headers(api_key), timeout=8,
+        )
         if r.status_code == 200:
             return r.json().get("market", {})
     except Exception:
@@ -230,508 +241,386 @@ def fetch_market_detail(api_key, ticker):
     return {}
 
 
-# ── Math helpers ────────────────────────────────────────────────────────────
+# ── Spread metrics ─────────────────────────────────────────────────────────
+
 
 def compute_spread_metrics(market):
-    """
-    Compute bid/ask/mid/spread from Kalshi market data.
-    FIXED: vig is the single spread (yes_ask - yes_bid), not doubled.
-    """
+    """Fixed from v1: vig = single spread, not doubled."""
     try:
         yes_bid = float(market.get("yes_bid_dollars", 0) or 0) * 100
         yes_ask = float(market.get("yes_ask_dollars", 0) or 0) * 100
         no_bid = float(market.get("no_bid_dollars", 0) or 0) * 100
         no_ask = float(market.get("no_ask_dollars", 0) or 0) * 100
-
         if yes_ask == 0 and no_bid > 0:
             yes_ask = 100 - no_bid
         if no_ask == 0 and yes_bid > 0:
             no_ask = 100 - yes_bid
-
         mid = (yes_bid + yes_ask) / 2 if yes_ask > 0 else yes_bid
-        spread = (yes_ask - yes_bid) if yes_ask > 0 else None
-
-        # Vig = the spread. On Kalshi yes+no are the same contract,
-        # so the vig is just the bid-ask spread (NOT doubled).
+        spread = yes_ask - yes_bid if yes_ask > 0 else None
         vig = spread
-
         return {
-            "yes_bid": yes_bid,
-            "yes_ask": yes_ask,
-            "no_bid": no_bid,
-            "no_ask": no_ask,
-            "mid": mid,
-            "spread": spread,
-            "vig": vig,
+            "yes_bid": yes_bid, "yes_ask": yes_ask,
+            "no_bid": no_bid, "no_ask": no_ask,
+            "mid": mid, "spread": spread, "vig": vig,
         }
     except Exception:
         return {}
 
 
-def mid_to_american(prob):
-    """Convert 0–100 implied probability to American odds string."""
-    if prob <= 0 or prob >= 100:
-        return "N/A"
-    if prob >= 50:
-        return f"-{int(round(prob / (100 - prob) * 100))}"
-    else:
-        return f"+{int(round((100 - prob) / prob * 100))}"
-
-
-def american_to_implied(odds_str):
-    """Convert American odds string to implied probability 0–100."""
-    try:
-        odds = int(odds_str.replace("+", ""))
-        if odds > 0:
-            return 100 / (odds + 100) * 100
-        else:
-            return abs(odds) / (abs(odds) + 100) * 100
-    except Exception:
-        return 0
-
-
-def kelly_fraction(true_prob, book_odds_american):
-    """
-    Kelly criterion: what % of bankroll to bet.
-    true_prob: 0–1 (from Kalshi mid)
-    book_odds_american: the line you'd actually bet at the window
-    Returns fraction of bankroll (0.0 to ~0.25, capped at quarter-Kelly for safety)
-    """
-    try:
-        odds = int(book_odds_american.replace("+", ""))
-        if odds > 0:
-            b = odds / 100  # profit per $1 bet
-        else:
-            b = 100 / abs(odds)
-
-        p = true_prob
-        q = 1 - p
-        f = (p * b - q) / b
-        # Cap at quarter-Kelly (standard conservative approach)
-        return max(0, min(f * 0.25, 0.15))
-    except Exception:
-        return 0
-
-
 def market_quality(spread, volume):
-    """Classify market quality."""
     if spread is None or volume < 100:
-        return "NO_DATA", "⚪", "#555"
+        return "DEAD", "---", 0
     if spread <= 2 and volume > 5000:
-        return "SHARP", "🟢", "#2e8b57"
+        return "SHARP", "S", 3
     if spread <= 3 and volume > 2000:
-        return "SHARP", "🟢", "#2e8b57"
+        return "SOLID", "S", 2
     if spread <= 4 and volume > 500:
-        return "LIQUID", "🟡", "#b8860b"
-    if spread > 8:
-        return "WIDE", "🔴", "#c0392b"
-    return "MODERATE", "🟡", "#b8860b"
+        return "LIQUID", "L", 1
+    if spread <= 6 and volume > 200:
+        return "THIN", "T", 0
+    if spread > 6:
+        return "WIDE", "W", -1
+    return "OK", "O", 0
 
 
-def guess_seeds(fav_name, dog_name):
-    """Try to guess seed matchup from team names."""
-    fav_seed = TEAM_SEEDS_2026.get(fav_name.upper().strip())
-    dog_seed = TEAM_SEEDS_2026.get(dog_name.upper().strip())
-    return fav_seed, dog_seed
+# ── Core analysis engine ──────────────────────────────────────────────────
 
 
-def seed_context(fav_seed, dog_seed):
-    """Return historical upset rate context if we know the seeds."""
-    if fav_seed is None or dog_seed is None:
-        return None
-    key = (min(fav_seed, dog_seed), max(fav_seed, dog_seed))
-    rate = SEED_UPSET_RATES.get(key)
-    if rate is None:
-        return None
-    return {
-        "matchup": f"#{key[0]} vs #{key[1]}",
-        "upset_rate": rate,
-        "upset_pct": int(round(rate * 100)),
-    }
-
-
-# ── The core analysis engine ───────────────────────────────────────────────
-
-def full_game_analysis(fav_mid, dog_mid, spread, volume, fav_name, dog_name):
-    """
-    Returns a dict with everything the card needs:
-      verdict, color, detail, window_guide[], kelly_table[], seed_info
-    """
+def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name,
+                 bankroll, kelly_mult, team_seeds):
     result = {
-        "verdict": "",
-        "color": "#555",
-        "detail": "",
-        "window_guide": [],   # list of {"label": ..., "value": ...}
-        "kelly_table": [],    # list of {"book_line": ..., "kelly_pct": ..., "edge": ...}
-        "seed_info": None,
-        "quality": "NO_DATA",
+        "verdict": "--- NO DATA", "color": "#555",
+        "detail": "", "action_line": "No action.",
+        "fav_target": "N/A", "dog_target": "N/A",
+        "kelly_fav_dollars": 0, "kelly_dog_dollars": 0,
+        "edge_fav_cents": 0, "edge_dog_cents": 0,
+        "seed_note": None,
     }
 
-    quality, quality_icon, quality_color = market_quality(spread, volume)
-    result["quality"] = quality
-    result["quality_icon"] = quality_icon
-    result["quality_color"] = quality_color
+    q_label, q_icon, q_score = market_quality(spread, volume)
 
-    if quality == "NO_DATA":
-        result["verdict"] = "⚪ NO DATA"
-        result["detail"] = "Not enough liquidity to generate a signal."
+    if q_score < 0 or (spread is None and volume < 100):
+        result["detail"] = "Market too thin (spread " + str(spread or "?") + " cents, vol " + str(int(volume)) + "). Price is noise."
+        result["verdict"] = "--- SKIP"
+        result["color"] = "#666"
         return result
 
-    if quality == "WIDE":
-        result["verdict"] = "⚪ SKIP"
-        result["color"] = "#888"
-        result["detail"] = f"Spread is {spread:.0f}¢ — too wide. Kalshi price is noise, not signal."
+    fav_fair = prob_to_american(fav_mid)
+    dog_fair = prob_to_american(dog_mid)
+    retail_fav_implied = estimate_retail_implied(fav_mid)
+    retail_dog_implied = estimate_retail_implied(dog_mid)
+    retail_fav_odds = prob_to_american(retail_fav_implied)
+    retail_dog_odds = prob_to_american(retail_dog_implied)
+    fav_target = value_target(fav_mid)
+    dog_target = value_target(dog_mid)
+    result["fav_target"] = fav_target
+    result["dog_target"] = dog_target
+    result["edge_fav_cents"] = retail_fav_implied - fav_mid
+    result["edge_dog_cents"] = dog_mid - retail_dog_implied
+
+    k_fav = kelly_fraction(fav_mid, retail_fav_implied) * kelly_mult
+    k_dog = kelly_fraction(dog_mid, retail_dog_implied) * kelly_mult
+    result["kelly_fav_dollars"] = bankroll * min(k_fav, 0.25)
+    result["kelly_dog_dollars"] = bankroll * min(k_dog, 0.25)
+
+    # Seed context
+    fav_seed = team_seeds.get(fav_name.upper().strip())
+    dog_seed = team_seeds.get(dog_name.upper().strip())
+    if fav_seed and dog_seed:
+        key = (min(fav_seed, dog_seed), max(fav_seed, dog_seed))
+        hist = SEED_UPSET_RATES.get(key)
+        if hist:
+            note = ("Since 1985: #" + str(dog_seed) + " seeds beat #" + str(fav_seed)
+                    + " seeds " + str(hist) + "% of the time. Kalshi has this dog at "
+                    + str(int(dog_mid)) + "%.")
+            if dog_mid < hist - 5:
+                note += (" Kalshi is " + str(int(hist - dog_mid))
+                         + " cents BELOW historical rate - market might be underpricing the upset.")
+            elif dog_mid > hist + 5:
+                note += (" Market is " + str(int(dog_mid - hist))
+                         + " cents ABOVE historical rate - this specific dog may be stronger than typical.")
+            result["seed_note"] = note
+
+    # Verdict logic
+    if q_label in ("DEAD", "WIDE"):
+        result["verdict"] = "--- SKIP"
+        result["color"] = "#666"
+        result["detail"] = "Spread is " + str(int(spread)) + " cents wide. Price could be off by 5-10 cents either way."
+        result["action_line"] = "Don't use this as a signal."
         return result
 
-    fav_american = mid_to_american(fav_mid)
-    dog_american = mid_to_american(dog_mid)
+    thin_warning = ""
+    if q_label == "THIN":
+        thin_warning = " (thin market - half your normal size)"
 
-    # ── Seed context ──
-    fav_seed, dog_seed = guess_seeds(fav_name, dog_name)
-    sc = seed_context(fav_seed, dog_seed)
-    if sc:
-        result["seed_info"] = sc
-        # If Kalshi's dog_mid is meaningfully off from historical base rate, flag it
-        if abs(dog_mid - sc["upset_pct"]) > 8:
-            result["seed_info"]["note"] = (
-                f"History says {sc['matchup']} upsets hit {sc['upset_pct']}% of the time. "
-                f"Kalshi has {dog_mid:.0f}%. {'Kalshi is higher — market sees something.' if dog_mid > sc['upset_pct'] else 'Kalshi is lower — could be value on the dog.'}"
-            )
+    if fav_mid >= 85:
+        result["verdict"] = "HEAVY CHALK"
+        result["color"] = "#b8860b"
+        result["detail"] = (fav_name + " at " + str(int(fav_mid)) + "% (" + fav_fair + "). "
+            + "Retail probably posts " + retail_fav_odds + " or worse. "
+            + "Risk/reward is terrible." + thin_warning)
+        result["action_line"] = ("Skip the favorite. The only play: if " + dog_name
+            + " is on the board at " + dog_target + " or better, "
+            + "that's a sprinkle for $" + str(int(result["kelly_dog_dollars"])) + ". Otherwise pass.")
 
-    # ── Verdict logic ──
-    if quality == "MODERATE" and volume < 500:
-        result["verdict"] = "🟡 THIN — PROCEED WITH CAUTION"
-        result["color"] = "#b8860b"
-        result["detail"] = (
-            f"Market is tradeable but not sharp. Kalshi mid: fav {fav_mid:.0f}¢ / dog {dog_mid:.0f}¢. "
-            f"Treat as directional guidance only."
-        )
-    elif fav_mid >= 88:
-        result["verdict"] = "🟡 HEAVY CHALK"
-        result["color"] = "#b8860b"
-        result["detail"] = (
-            f"Kalshi: {fav_mid:.0f}% ({fav_american}). "
-            f"Almost never worth laying this much at retail. "
-            f"Only if you find {mid_to_american(fav_mid + 5)} or better, which you won't."
-        )
-    elif fav_mid >= 78:
-        result["verdict"] = "🟡 FAV OK IF PRICE IS RIGHT"
-        result["color"] = "#b8860b"
-        result["detail"] = (
-            f"Kalshi says {fav_mid:.0f}% true probability. "
-            f"Only worth it at the window if you see the favorite at "
-            f"{mid_to_american(fav_mid + 3)} or softer (i.e., cheaper than fair)."
-        )
-    elif 25 <= dog_mid <= 45 and quality == "SHARP":
-        result["verdict"] = "🟢 BET THE DOG"
-        result["color"] = "#2e8b57"
-        result["detail"] = (
-            f"Sharp money says {dog_mid:.0f}% ({dog_american}). "
-            f"Retail books systematically underprice underdogs in this zone. "
-            f"Look for {mid_to_american(max(dog_mid - 5, 1))} or better at the window."
-        )
-    elif 20 <= dog_mid < 25 and quality == "SHARP":
-        result["verdict"] = "🟢 DOG SPRINKLE"
-        result["color"] = "#2e8b57"
-        result["detail"] = (
-            f"Kalshi: {dog_mid:.0f}% ({dog_american}). Long shot but in the "
-            f"value zone if retail is offering {mid_to_american(max(dog_mid - 4, 1))} or better. "
-            f"Small bet only — quarter unit max."
-        )
-    elif 55 <= fav_mid < 68 and quality in ("SHARP", "LIQUID"):
-        result["verdict"] = "🟢 LIVE GAME WATCH"
-        result["color"] = "#2e8b57"
-        result["detail"] = (
-            f"Coin-flip-ish game ({fav_mid:.0f}/{dog_mid:.0f}). "
-            f"This is your live betting play: watch both apps, "
-            f"bet when Kalshi jumps and the El Cortez board lags. Window is 30s–2min."
-        )
-    elif 68 <= fav_mid < 78 and quality in ("SHARP", "LIQUID"):
-        result["verdict"] = "🟡 LEAN FAV — CHECK LINE"
-        result["color"] = "#b8860b"
-        result["detail"] = (
-            f"Kalshi: {fav_mid:.0f}% ({fav_american}). "
-            f"If El Cortez is softer than {fav_american}, take it. "
-            f"If they're sharper, look at the dog side."
-        )
+    elif 20 <= dog_mid <= 45 and q_score >= 2:
+        result["verdict"] = "DOG VALUE"
+        result["color"] = "#2ecc71"
+        result["detail"] = ("Sharp market says " + dog_name + " wins " + str(int(dog_mid)) + "% (" + dog_fair + "). "
+            + "Retail books typically post " + retail_dog_odds + ", underpricing by ~"
+            + str(round(result["edge_dog_cents"], 1)) + " cents." + thin_warning)
+        result["action_line"] = ("AT THE WINDOW: " + dog_name + " at " + dog_target + " or better. "
+            + "If the board shows " + retail_dog_odds + " or higher, that's +EV. "
+            + "Size: $" + str(int(result["kelly_dog_dollars"])) + ".")
+
+    elif 55 <= fav_mid <= 72 and q_score >= 1:
+        result["verdict"] = "LIVE BET WATCH"
+        result["color"] = "#3498db"
+        result["detail"] = ("Close game: " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + ". "
+            + "Sharp money is split. This is your live-line-lag play - "
+            + "Kalshi reprices in seconds, the book takes 30-90 sec after big runs." + thin_warning)
+        max_kelly = max(result["kelly_fav_dollars"], result["kelly_dog_dollars"])
+        result["action_line"] = ("Both apps open during the game. "
+            + "Pregame fair: " + fav_name + " " + fav_fair + " / " + dog_name + " " + dog_fair + ". "
+            + "When momentum shifts, bet whichever side the board hasn't caught up on. "
+            + "Max size: $" + str(int(max_kelly)) + ".")
+
+    elif 72 < fav_mid < 85:
+        result["verdict"] = "PRICE CHECK"
+        result["color"] = "#f39c12"
+        result["detail"] = (fav_name + " at " + str(int(fav_mid)) + "% (" + fav_fair + "). "
+            + "Retail likely posts " + retail_fav_odds + ". "
+            + "Decent favorite - only worth it if the book is generous." + thin_warning)
+        result["action_line"] = ("At the window - two options: "
+            + "(1) " + fav_name + " at " + fav_target + " or better = bet $" + str(int(result["kelly_fav_dollars"])) + ". "
+            + "(2) " + dog_name + " at " + dog_target + " or better = bet $" + str(int(result["kelly_dog_dollars"])) + ". "
+            + "If neither hits the target, pass.")
+
+    elif 45 <= fav_mid <= 55:
+        result["verdict"] = "TOSS-UP"
+        result["color"] = "#9b59b6"
+        result["detail"] = ("Market says " + str(int(fav_mid)) + "/" + str(int(dog_mid))
+            + " - near even. Vig kills you on coin flips unless one side is mispriced." + thin_warning)
+        result["action_line"] = ("Compare both sides on the board: "
+            + fav_name + " fair = " + fav_fair + " / " + dog_name + " fair = " + dog_fair + ". "
+            + "Bet whichever side the board gives you the biggest discount vs fair. "
+            + "If neither side beats fair, skip.")
+
+    elif 20 <= dog_mid <= 45 and q_score < 2:
+        result["verdict"] = "DOG - LOW CONFIDENCE"
+        result["color"] = "#d4a017"
+        result["detail"] = (dog_name + " at " + str(int(dog_mid)) + "% (" + dog_fair + ") but market is "
+            + q_label.lower() + ". The mid could be off by 5+ cents. Don't size like a sharp signal.")
+        result["action_line"] = ("Half size only. " + dog_name + " at " + dog_target
+            + " or better = $" + str(int(result["kelly_dog_dollars"] * 0.5)) + " max.")
+
     else:
-        result["verdict"] = "⚪ NO CLEAR EDGE"
-        result["color"] = "#888"
-        result["detail"] = (
-            f"Kalshi: {fav_mid:.0f}% fav / {dog_mid:.0f}% dog. "
-            f"No obvious mispricing to exploit. Save your bankroll."
-        )
-
-    # ── "AT THE WINDOW" guide ──
-    # For each side, show: what Kalshi says fair odds are, what to look for,
-    # and the threshold where you have a real edge
-
-    # Favorite side
-    fair_fav = fav_american
-    # You want to find the fav CHEAPER than fair → that means the book's number
-    # is less negative (e.g., Kalshi says -250 fair, book shows -200 = value)
-    value_fav = mid_to_american(fav_mid + 4)  # 4¢ edge = real money
-    good_fav = mid_to_american(fav_mid + 2)   # 2¢ = marginal
-
-    # Underdog side
-    fair_dog = dog_american
-    # You want the dog at LONGER odds than fair → book shows +350 when fair is +300
-    value_dog = mid_to_american(max(dog_mid - 4, 1))
-    good_dog = mid_to_american(max(dog_mid - 2, 1))
-
-    result["window_guide"] = [
-        {
-            "side": "FAV",
-            "team": fav_name,
-            "fair": fair_fav,
-            "good": good_fav,
-            "great": value_fav,
-            "explanation": (
-                f"Fair line is ~{fair_fav}. "
-                f"If board shows {good_fav} or softer → decent. "
-                f"{value_fav} or softer → strong edge, bet it."
-            ),
-        },
-        {
-            "side": "DOG",
-            "team": dog_name,
-            "fair": fair_dog,
-            "good": good_dog,
-            "great": value_dog,
-            "explanation": (
-                f"Fair line is ~{fair_dog}. "
-                f"If board shows {good_dog} or longer → decent. "
-                f"{value_dog} or longer → strong edge, bet it."
-            ),
-        },
-    ]
-
-    # ── Kelly table ──
-    # Show a few realistic book lines and how much to bet at each
-    true_dog_prob = dog_mid / 100
-    true_fav_prob = fav_mid / 100
-
-    dog_lines = []
-    fav_lines = []
-
-    # Generate realistic book lines around the fair price
-    if dog_mid > 5:
-        for offset in [-6, -4, -2, 0, +2, +4]:
-            test_prob = dog_mid + offset
-            if test_prob <= 0 or test_prob >= 100:
-                continue
-            test_line = mid_to_american(test_prob)
-            kf = kelly_fraction(true_dog_prob, test_line)
-            edge = true_dog_prob - (test_prob / 100)
-            if kf > 0.001:
-                dog_lines.append({
-                    "book_line": test_line,
-                    "kelly_pct": f"{kf * 100:.1f}%",
-                    "edge": f"+{edge * 100:.1f}¢",
-                    "tag": "✅ BET" if kf >= 0.02 else "⚠️ SMALL",
-                })
-            elif edge > 0:
-                dog_lines.append({
-                    "book_line": test_line,
-                    "kelly_pct": "—",
-                    "edge": f"+{edge * 100:.1f}¢",
-                    "tag": "🔸 MARGINAL",
-                })
-
-    result["kelly_table_dog"] = dog_lines
-
-    if fav_mid < 95:
-        for offset in [-4, -2, 0, +2, +4, +6]:
-            test_prob = fav_mid + offset
-            if test_prob <= 0 or test_prob >= 100:
-                continue
-            test_line = mid_to_american(test_prob)
-            kf = kelly_fraction(true_fav_prob, test_line)
-            edge = true_fav_prob - (test_prob / 100)
-            if kf > 0.001:
-                fav_lines.append({
-                    "book_line": test_line,
-                    "kelly_pct": f"{kf * 100:.1f}%",
-                    "edge": f"+{edge * 100:.1f}¢",
-                    "tag": "✅ BET" if kf >= 0.02 else "⚠️ SMALL",
-                })
-            elif edge > 0:
-                fav_lines.append({
-                    "book_line": test_line,
-                    "kelly_pct": "—",
-                    "edge": f"+{edge * 100:.1f}¢",
-                    "tag": "🔸 MARGINAL",
-                })
-
-    result["kelly_table_fav"] = fav_lines
+        result["verdict"] = "PASS"
+        result["color"] = "#666"
+        result["detail"] = "No clear edge. " + str(int(fav_mid)) + "/" + str(int(dog_mid)) + " split."
+        result["action_line"] = "No action."
 
     return result
 
 
-# ── UI ──────────────────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="March Madness · Kalshi Live",
-    page_icon="🏀",
-    layout="wide",
-)
 
-st.title("🏀 March Madness — Kalshi Live Dashboard")
-st.caption(f"Last refreshed: {datetime.now().strftime('%I:%M:%S %p')}  ·  v2 El Cortez Edition")
+st.set_page_config(page_title="March Madness Kalshi v2", page_icon="", layout="wide")
 
-# ── Sidebar ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.game-card {border:1px solid #333; border-radius:14px; padding:18px; margin-bottom:14px; background:#1a1a1a;}
+.v-line {font-size:1.5em; font-weight:800; margin:6px 0 10px 0;}
+.sbox {flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;}
+.slbl {font-size:0.72em; color:#aaa; text-transform:uppercase; letter-spacing:0.5px;}
+.sname {font-size:1.05em; font-weight:700; color:#fff;}
+.sprice {font-size:1.35em; font-weight:800;}
+.sodds {font-size:0.85em; color:#aaa;}
+.act-box {background:#111; border-left:3px solid; padding:10px 14px; border-radius:4px; font-size:0.92em; color:#eee; margin-top:8px; line-height:1.6;}
+.det-box {font-size:0.82em; color:#999; padding:4px 0 6px 0;}
+.kb {display:inline-block; background:#2a2a2a; border-radius:6px; padding:3px 8px; font-size:0.78em; color:#ccc; margin:2px 4px 2px 0;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("March Madness - Kalshi Live Dashboard v2")
+st.caption("Last refresh: " + datetime.now().strftime("%I:%M:%S %p") + "  |  Auto-updates")
+
+# ── Sidebar ────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("⚙️ Settings")
-
+    st.header("Settings")
     api_key = get_api_key()
     if not api_key:
         api_key = st.text_input(
-            "Kalshi API Key",
-            type="password",
-            help="Paste your key here, or set KALSHI_API_KEY in Streamlit secrets",
+            "Kalshi API Key", type="password",
+            help="Paste here or set KALSHI_API_KEY in Streamlit secrets",
         )
     else:
-        st.success("✅ API key loaded")
-
-    refresh_rate = st.slider("Refresh interval (seconds)", 10, 120, 30)
+        st.success("API key loaded")
 
     st.divider()
-    st.header("💰 Bankroll")
-    bankroll = st.number_input("Your bankroll ($)", min_value=10, max_value=50000, value=500, step=50)
-    st.caption("Kelly sizing below will use this number.")
+    st.subheader("Bankroll and Sizing")
+    bankroll = st.number_input("Bankroll ($)", min_value=50, max_value=50000, value=500, step=50)
+    kelly_mode = st.radio(
+        "Sizing mode",
+        ["Quarter Kelly (safe)", "Half Kelly", "Full Kelly (aggressive)"],
+        index=0,
+    )
+    kelly_mult = {
+        "Quarter Kelly (safe)": 0.25,
+        "Half Kelly": 0.5,
+        "Full Kelly (aggressive)": 1.0,
+    }[kelly_mode]
 
     st.divider()
-    st.markdown("### 📖 Quick Reference")
+    st.subheader("Refresh")
+    refresh_rate = st.slider("Refresh (sec)", 5, 120, 20, help="5-10 for live games, 30+ for pregame")
+
+    st.divider()
+    st.subheader("Seeds (optional)")
+    st.caption("Add seeds for historical upset context. One per line: DUKE=1")
+    seed_input = st.text_area("Team seeds", placeholder="DUKE=1\nTCU=8\nHOWARD=16\nMICH=1", height=100)
+    team_seeds = {}
+    if seed_input:
+        for line in seed_input.strip().split("\n"):
+            if "=" in line:
+                parts = line.split("=")
+                try:
+                    team_seeds[parts[0].strip().upper()] = int(parts[1].strip())
+                except Exception:
+                    pass
+        if team_seeds:
+            st.success("Loaded " + str(len(team_seeds)) + " seeds")
+
+    st.divider()
     st.markdown("""
-**Reading the cards:**
-- **Mid** = Kalshi's best estimate of true probability
-- **Spread** = market tightness (lower = more reliable)
-- 🟢 Sharp = lots of informed traders, trust the price
-- 🟡 Liquid = decent but not definitive
-- 🔴 Wide = ignore the price
-
-**At the window:**
-- "Softer" favorite = less negative number (−200 is softer than −250)
-- "Longer" underdog = more positive number (+350 is longer than +300)
-- You WANT softer favorites and longer underdogs vs Kalshi's fair price
-
-**Kelly sizing:**
-- Shows quarter-Kelly (conservative) to avoid ruin
-- "✅ BET" = meaningful edge, worth a wager
-- "⚠️ SMALL" = edge exists but tiny
-- "🔸 MARGINAL" = barely positive, skip unless you love the spot
+**At the sportsbook:**
+- Green verdict = go look at the board now
+- Yellow verdict = only if the price is right
+- Gray verdict = skip
+- **Target** = minimum odds to bet
+- **Kelly $** = how much to wager
+- Board shows >= target = **bet it**
     """)
 
 if not api_key:
-    st.warning("👈 Enter your Kalshi API key in the sidebar to get started.")
+    st.warning("Enter your Kalshi API key in the sidebar to start.")
     st.stop()
 
-# ── Main content ─────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────
 
-with st.spinner("Fetching Kalshi NCAA markets..."):
-    markets = fetch_ncaa_markets(api_key, ttl_seconds=min(refresh_rate, 30))
+with st.spinner("Pulling Kalshi NCAA markets..."):
+    markets = fetch_ncaa_markets(api_key)
 
 if not markets:
-    st.warning("No NCAA markets found. Let's diagnose and search manually.")
+    st.warning("No NCAA markets found. Diagnostics below.")
 
-    with st.expander("🔍 Diagnostic — show all open Kalshi events"):
+    with st.expander("Diagnostic - all open Kalshi events", expanded=True):
+        st.caption("Look for anything with KXNCAAMB in the ticker.")
         try:
             r = requests.get(
-                f"{BASE_URL}/events",
+                BASE_URL + "/events",
                 params={"status": "open", "limit": 50, "with_nested_markets": "false"},
-                headers=kalshi_headers(api_key),
-                timeout=10,
+                headers=kalshi_headers(api_key), timeout=10,
             )
             if r.status_code == 200:
                 events = r.json().get("events", [])
                 if events:
-                    diag_df = pd.DataFrame([
-                        {
-                            "event_ticker": e.get("event_ticker"),
-                            "title": e.get("title"),
-                            "category": e.get("category"),
-                        }
-                        for e in events
-                    ])
-                    st.dataframe(diag_df, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"ticker": e.get("event_ticker"), "title": e.get("title")}
+                            for e in events
+                        ]),
+                        use_container_width=True, hide_index=True,
+                    )
+                else:
+                    st.error("API returned 0 events. API key may lack sports access, or Nevada geo-block.")
             else:
-                st.error(f"API error {r.status_code}: {r.text}")
+                st.error("API error " + str(r.status_code))
         except Exception as ex:
-            st.error(f"Request failed: {ex}")
+            st.error("Request failed: " + str(ex))
 
-    st.subheader("🔍 Manual search")
-    col_a, col_b = st.columns(2)
-    with col_a:
+    with st.expander("Direct KXNCAAMBGAME fetch (debug)", expanded=True):
+        try:
+            r = requests.get(
+                BASE_URL + "/markets",
+                params={"series_ticker": "KXNCAAMBGAME", "limit": 200},
+                headers=kalshi_headers(api_key), timeout=8,
+            )
+            st.write("Status: " + str(r.status_code))
+            data = r.json()
+            raw_markets = data.get("markets", [])
+            st.write("Raw markets returned: " + str(len(raw_markets)))
+            if raw_markets:
+                sample = {}
+                for k in ["ticker", "title", "status", "close_time", "yes_bid_dollars"]:
+                    if k in raw_markets[0]:
+                        sample[k] = raw_markets[0][k]
+                st.write("First market:", sample)
+                filtered = _filter_today(raw_markets)
+                st.write("After time filter: " + str(len(filtered)))
+                if not filtered and raw_markets:
+                    st.warning("All markets filtered out by time window. Showing all anyway.")
+                    markets = raw_markets
+        except Exception as ex:
+            st.error("Direct fetch failed: " + str(ex))
+
+    st.subheader("Manual ticker search")
+    c1, c2 = st.columns(2)
+    with c1:
         manual_event = st.text_input("Event ticker")
         if manual_event:
             try:
                 r = requests.get(
-                    f"{BASE_URL}/events/{manual_event.upper()}",
+                    BASE_URL + "/events/" + manual_event.upper(),
                     params={"with_nested_markets": "true"},
-                    headers=kalshi_headers(api_key),
-                    timeout=8,
+                    headers=kalshi_headers(api_key), timeout=8,
                 )
                 if r.status_code == 200:
                     markets = r.json().get("event", {}).get("markets", [])
-                    st.success(f"Found {len(markets)} markets")
+                    st.success("Found " + str(len(markets)) + " markets")
                 else:
-                    st.error(f"Not found ({r.status_code})")
+                    st.error("Not found (" + str(r.status_code) + ")")
             except Exception as ex:
                 st.error(str(ex))
-    with col_b:
+    with c2:
         manual_ticker = st.text_input("Market ticker")
         if manual_ticker:
-            detail = fetch_market_detail(api_key, manual_ticker.upper())
-            if detail:
-                markets = [detail]
-                st.success(f"Found: {detail.get('title')}")
+            d = fetch_market_detail(api_key, manual_ticker.upper())
+            if d:
+                markets = [d]
+                st.success("Found: " + str(d.get("title", "")))
             else:
-                st.error(f"Not found: {manual_ticker}")
+                st.error("Not found")
 
 if markets:
-    # ── Group by game (event) ────────────────────────────────────────────
+    # Group by game
     games = defaultdict(list)
     for m in markets:
-        # Only keep "Winner" markets, skip spreads/totals if present
-        title = (m.get("title", "") + " " + m.get("subtitle", "")).lower()
-        if "winner" in title or "win" in title or not any(
-            kw in title for kw in ["spread", "total", "over", "under", "points"]
-        ):
-            event = m.get("event_ticker", m.get("ticker", ""))
-            games[event].append(m)
+        title = (m.get("title", "") + m.get("subtitle", "")).lower()
+        skip_keywords = ["spread", "total", "over", "under", "point", "half"]
+        if any(kw in title for kw in skip_keywords):
+            continue
+        event = m.get("event_ticker", m.get("ticker", ""))
+        games[event].append(m)
 
-    # ── Render game cards ────────────────────────────────────────────────
-    game_list = sorted(games.items())
-    st.markdown(f"### 🏀 {len(game_list)} Games")
-
-    for event_ticker, game_markets in game_list:
-        # Sort: highest yes_bid first = favorite
-        game_markets.sort(
-            key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True
-        )
-        if len(game_markets) < 2:
+    # Analyze each game
+    analyses = []
+    for event_ticker, gm in games.items():
+        gm.sort(key=lambda m: float(m.get("yes_bid_dollars", 0) or 0), reverse=True)
+        if len(gm) < 2:
             continue
 
-        fav = game_markets[0]
-        dog = game_markets[1]
+        fav, dog = gm[0], gm[1]
         fav_m = compute_spread_metrics(fav)
         dog_m = compute_spread_metrics(dog)
 
-        # Extract team names
-        fav_name = (
-            fav.get("yes_sub_title")
-            or fav.get("subtitle")
-            or fav.get("ticker", "").split("-")[-1]
-        )
-        dog_name = (
-            dog.get("yes_sub_title")
-            or dog.get("subtitle")
-            or dog.get("ticker", "").split("-")[-1]
-        )
+        fav_name = fav.get("yes_sub_title") or fav.get("subtitle") or fav.get("ticker", "").split("-")[-1]
+        dog_name = dog.get("yes_sub_title") or dog.get("subtitle") or dog.get("ticker", "").split("-")[-1]
         if fav_name == dog_name:
             fav_name = fav.get("ticker", "").split("-")[-1]
-            dog_name = dog.get("ticker", "").split("-")[-2] if len(dog.get("ticker", "").split("-")) > 2 else "?"
+            dog_name = dog.get("ticker", "").split("-")[-1]
 
         fav_vol = float(fav.get("volume_fp", 0) or 0)
         dog_vol = float(dog.get("volume_fp", 0) or 0)
@@ -739,144 +628,160 @@ if markets:
         spread = fav_m.get("spread")
         fav_mid = fav_m.get("mid", 0)
         dog_mid = dog_m.get("mid", 0)
+        game_title = fav.get("title", event_ticker).replace(" Winner?", "").replace(" winner?", "").strip()
 
-        game_title = (
-            fav.get("title", event_ticker)
-            .replace(" Winner?", "")
-            .replace(" winner?", "")
-            .strip()
+        a = analyze_game(
+            fav_mid, dog_mid, spread, total_vol,
+            fav_name, dog_name, bankroll, kelly_mult, team_seeds,
         )
 
-        # ── Run full analysis ──
-        analysis = full_game_analysis(
-            fav_mid, dog_mid, spread, total_vol, fav_name, dog_name
-        )
+        analyses.append({
+            "event_ticker": event_ticker, "title": game_title,
+            "fav_name": fav_name, "dog_name": dog_name,
+            "fav_mid": fav_mid, "dog_mid": dog_mid,
+            "fav_m": fav_m, "dog_m": dog_m,
+            "spread": spread, "vol": total_vol,
+            "a": a,
+            "quality": market_quality(spread, total_vol),
+        })
 
-        verdict = analysis["verdict"]
-        vcolor = analysis["color"]
-        detail = analysis["detail"]
-        quality_icon = analysis.get("quality_icon", "⚪")
-        window = analysis.get("window_guide", [])
-        kelly_dog = analysis.get("kelly_table_dog", [])
-        kelly_fav = analysis.get("kelly_table_fav", [])
-        seed_info = analysis.get("seed_info")
+    # Sort: actionable first (green > yellow > gray)
+    def sort_key(g):
+        v = g["a"]["verdict"]
+        if "DOG VALUE" in v or "LIVE BET" in v:
+            return 0
+        if "TOSS" in v:
+            return 1
+        if "PRICE" in v or "CHALK" in v or "LOW CONF" in v:
+            return 2
+        return 3
 
-        fav_american = mid_to_american(fav_mid)
-        dog_american = mid_to_american(dog_mid)
+    analyses.sort(key=sort_key)
 
-        # ── Window guide HTML ──
-        window_html = ""
-        if window:
-            window_html = """
-<div style="margin-top:10px; padding:10px; background:#0d1117; border-radius:8px; border:1px solid #333;">
-  <div style="font-size:0.85em; font-weight:700; color:#58a6ff; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px;">🎯 AT THE WINDOW — What to look for</div>
-"""
-            for w in window:
-                side_color = "#4fc3f7" if w["side"] == "FAV" else "#ff8a65"
-                window_html += f"""
-  <div style="margin-bottom:6px; padding:6px 8px; background:#161b22; border-radius:4px; border-left:3px solid {side_color};">
-    <span style="font-weight:700; color:{side_color};">{w['team']}</span>
-    <span style="color:#888; font-size:0.8em;"> ({w['side']})</span><br/>
-    <span style="color:#ccc; font-size:0.85em;">{w['explanation']}</span>
-  </div>
-"""
-            window_html += "</div>"
+    n_action = sum(1 for g in analyses if g["a"]["color"] in ("#2ecc71", "#3498db"))
+    st.markdown("### " + str(len(analyses)) + " Games | " + str(n_action) + " Actionable")
 
-        # ── Kelly table HTML ──
-        kelly_html = ""
-        if kelly_dog or kelly_fav:
-            kelly_html = """
-<div style="margin-top:10px; padding:10px; background:#0d1117; border-radius:8px; border:1px solid #333;">
-  <div style="font-size:0.85em; font-weight:700; color:#58a6ff; margin-bottom:6px; text-transform:uppercase; letter-spacing:1px;">📊 BET SIZING (Quarter-Kelly, ${bankroll} roll)</div>
-""".replace("{bankroll}", f"{bankroll:,.0f}")
+    # Render cards
+    for g in analyses:
+        a = g["a"]
+        fm = g["fav_mid"]
+        dm = g["dog_mid"]
+        ql, qi, qs = g["quality"]
 
-            if kelly_dog:
-                kelly_html += f'<div style="font-size:0.8em; color:#ff8a65; font-weight:600; margin:6px 0 3px;">DOG: {dog_name}</div>'
-                kelly_html += '<div style="display:flex; flex-wrap:wrap; gap:4px;">'
-                for row in kelly_dog:
-                    bet_amt = kelly_fraction(dog_mid / 100, row["book_line"].replace("✅ BET", "").replace("⚠️ SMALL", "").strip()) * bankroll if "—" not in row["kelly_pct"] else 0
-                    kelly_html += f"""
-<div style="background:#161b22; border-radius:4px; padding:4px 8px; font-size:0.78em; text-align:center; min-width:70px;">
-  <div style="color:#aaa;">If board says</div>
-  <div style="font-weight:700; color:#fff; font-size:1.1em;">{row['book_line']}</div>
-  <div style="color:#aaa;">Edge: {row['edge']}</div>
-  <div style="color:{'#2e8b57' if '✅' in row['tag'] else '#b8860b' if '⚠' in row['tag'] else '#888'}; font-weight:600;">{row['tag']}</div>
-  {'<div style="color:#2e8b57; font-weight:700;">$' + f"{bet_amt:.0f}" + '</div>' if bet_amt > 1 else ''}
-</div>
-"""
-                kelly_html += "</div>"
+        fav_odds = prob_to_american(fm)
+        dog_odds = prob_to_american(dm)
+        ret_fav = prob_to_american(estimate_retail_implied(fm))
+        ret_dog = prob_to_american(estimate_retail_implied(dm))
 
-            if kelly_fav:
-                kelly_html += f'<div style="font-size:0.8em; color:#4fc3f7; font-weight:600; margin:8px 0 3px;">FAV: {fav_name}</div>'
-                kelly_html += '<div style="display:flex; flex-wrap:wrap; gap:4px;">'
-                for row in kelly_fav:
-                    bet_amt = kelly_fraction(fav_mid / 100, row["book_line"].replace("✅ BET", "").replace("⚠️ SMALL", "").strip()) * bankroll if "—" not in row["kelly_pct"] else 0
-                    kelly_html += f"""
-<div style="background:#161b22; border-radius:4px; padding:4px 8px; font-size:0.78em; text-align:center; min-width:70px;">
-  <div style="color:#aaa;">If board says</div>
-  <div style="font-weight:700; color:#fff; font-size:1.1em;">{row['book_line']}</div>
-  <div style="color:#aaa;">Edge: {row['edge']}</div>
-  <div style="color:{'#2e8b57' if '✅' in row['tag'] else '#b8860b' if '⚠' in row['tag'] else '#888'}; font-weight:600;">{row['tag']}</div>
-  {'<div style="color:#2e8b57; font-weight:700;">$' + f"{bet_amt:.0f}" + '</div>' if bet_amt > 1 else ''}
-</div>
-"""
-                kelly_html += "</div>"
-
-            kelly_html += "</div>"
-
-        # ── Seed context HTML ──
         seed_html = ""
-        if seed_info:
-            seed_html = f"""
-<div style="margin-top:8px; padding:6px 10px; background:#1c1c0e; border-radius:4px; border-left:3px solid #e6c200; font-size:0.82em;">
-  📜 <span style="color:#e6c200; font-weight:600;">History:</span>
-  <span style="color:#ccc;">{seed_info['matchup']} — underdogs win {seed_info['upset_pct']}% historically.</span>
-  {f'<br/><span style="color:#aaa;">' + seed_info.get("note", "") + '</span>' if seed_info.get("note") else ''}
-</div>
-"""
+        if a.get("seed_note"):
+            seed_html = '<div style="font-size:0.82em;color:#aaa;padding:4px 0;">' + a["seed_note"] + '</div>'
 
-        # ── Render the card ──
-        with st.container():
-            st.markdown(f"""
-<div style="border:1px solid #333; border-radius:12px; padding:16px; margin-bottom:16px; background:#1a1a1a;">
-  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-    <div style="font-size:1.05em; font-weight:600; color:#ddd;">🏀 {game_title}</div>
-    <div style="font-size:0.8em; color:#888;">{quality_icon} Spread: {f"{spread:.0f}¢" if spread else "—"} · Vol: {total_vol:,.0f}</div>
-  </div>
-  <div style="font-size:1.6em; font-weight:800; color:{vcolor}; margin-bottom:10px;">{verdict}</div>
-  <div style="display:flex; gap:16px; margin-bottom:10px;">
-    <div style="flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;">
-      <div style="font-size:0.75em; color:#aaa; text-transform:uppercase;">Favorite</div>
-      <div style="font-size:1.1em; font-weight:700; color:#fff;">{fav_name}</div>
-      <div style="font-size:1.4em; font-weight:800; color:#4fc3f7;">{fav_mid:.0f}¢</div>
-      <div style="font-size:0.9em; color:#aaa;">{fav_american}</div>
-    </div>
-    <div style="flex:1; background:#222; border-radius:8px; padding:10px; text-align:center;">
-      <div style="font-size:0.75em; color:#aaa; text-transform:uppercase;">Underdog</div>
-      <div style="font-size:1.1em; font-weight:700; color:#fff;">{dog_name}</div>
-      <div style="font-size:1.4em; font-weight:800; color:#ff8a65;">{dog_mid:.0f}¢</div>
-      <div style="font-size:0.9em; color:#aaa;">{dog_american}</div>
-    </div>
-  </div>
-  <div style="background:#111; border-left:3px solid {vcolor}; padding:8px 12px; border-radius:4px; font-size:0.88em; color:#ccc; margin-bottom:4px;">
-    💡 {detail}
-  </div>
-  {seed_html}
-  {window_html}
-  {kelly_html}
-</div>
-""", unsafe_allow_html=True)
+        spread_str = str(round(g["spread"], 1)) + " cents" if g["spread"] else "n/a"
+        vig_str = str(round(g["fav_m"].get("vig", 0), 1)) + " cents" if g["fav_m"].get("vig") else "n/a"
+        vol_str = "{:,.0f}".format(g["vol"])
 
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
+        card = (
+            '<div class="game-card">'
+            + '<div style="font-size:1.05em;font-weight:600;color:#ddd;">'
+            + g["title"]
+            + '<span style="float:right;font-size:0.8em;">' + ql + '</span>'
+            + '</div>'
+            + '<div class="v-line" style="color:' + a["color"] + ';">' + a["verdict"] + '</div>'
+            + '<div style="display:flex;gap:12px;margin-bottom:10px;">'
+            + '<div class="sbox">'
+            + '<div class="slbl">FAVORITE</div>'
+            + '<div class="sname">' + g["fav_name"] + '</div>'
+            + '<div class="sprice" style="color:#4fc3f7;">' + str(int(fm)) + ' cents</div>'
+            + '<div class="sodds">Fair: ' + fav_odds + '</div>'
+            + '<div class="sodds">Retail est: ' + ret_fav + '</div>'
+            + '<div class="sodds" style="color:#4fc3f7;">Target: ' + a["fav_target"] + '</div>'
+            + '</div>'
+            + '<div class="sbox">'
+            + '<div class="slbl">UNDERDOG</div>'
+            + '<div class="sname">' + g["dog_name"] + '</div>'
+            + '<div class="sprice" style="color:#ff8a65;">' + str(int(dm)) + ' cents</div>'
+            + '<div class="sodds">Fair: ' + dog_odds + '</div>'
+            + '<div class="sodds">Retail est: ' + ret_dog + '</div>'
+            + '<div class="sodds" style="color:#ff8a65;">Target: ' + a["dog_target"] + '</div>'
+            + '</div>'
+            + '<div class="sbox">'
+            + '<div class="slbl">MARKET</div>'
+            + '<div style="font-size:0.85em;color:#ccc;margin-top:6px;">'
+            + 'Spread: ' + spread_str + '<br>'
+            + 'Vig: ' + vig_str + '<br>'
+            + 'Vol: ' + vol_str
+            + '</div></div></div>'
+            + seed_html
+            + '<div style="margin-bottom:8px;">'
+            + '<span class="kb">Kelly ' + g["fav_name"] + ': $' + str(int(a["kelly_fav_dollars"])) + '</span>'
+            + '<span class="kb">Kelly ' + g["dog_name"] + ': $' + str(int(a["kelly_dog_dollars"])) + '</span>'
+            + '</div>'
+            + '<div class="det-box">' + a["detail"] + '</div>'
+            + '<div class="act-box" style="border-left-color:' + a["color"] + ';">'
+            + a["action_line"]
+            + '</div></div>'
+        )
+        st.markdown(card, unsafe_allow_html=True)
+
+    # Order book viewer
+    with st.expander("Order Book Depth"):
+        ticker_opts = {}
+        for g in analyses:
+            for m in games[g["event_ticker"]]:
+                label = g["title"] + " - " + m.get("yes_sub_title", m.get("ticker", ""))
+                ticker_opts[label] = m["ticker"]
+        if ticker_opts:
+            sel = st.selectbox("Select market", list(ticker_opts.keys()))
+            ob = fetch_orderbook(api_key, ticker_opts[sel])
+            if ob:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**YES bids**")
+                    yb = ob.get("yes", {}).get("bids", [])
+                    if yb:
+                        st.dataframe(pd.DataFrame(yb), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Empty")
+                with c2:
+                    st.markdown("**NO bids**")
+                    nb = ob.get("no", {}).get("bids", [])
+                    if nb:
+                        st.dataframe(pd.DataFrame(nb), use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Empty")
+
+    # Quick reference table
+    with st.expander("Quick Reference - All Games"):
+        rows = []
+        for g in analyses:
+            a = g["a"]
+            rows.append({
+                "Game": g["title"],
+                "Verdict": a["verdict"],
+                "Fav": g["fav_name"],
+                "Fav cents": str(int(g["fav_mid"])),
+                "Fav Fair": prob_to_american(g["fav_mid"]),
+                "Fav Target": a["fav_target"],
+                "Dog": g["dog_name"],
+                "Dog cents": str(int(g["dog_mid"])),
+                "Dog Fair": prob_to_american(g["dog_mid"]),
+                "Dog Target": a["dog_target"],
+                "Quality": g["quality"][0],
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ── Auto-refresh ───────────────────────────────────────────────────────────
 
 st.divider()
-col_left, col_right = st.columns([3, 1])
-with col_right:
-    if st.button("🔄 Refresh now"):
+c1, c2 = st.columns([3, 1])
+with c2:
+    if st.button("Refresh now"):
         st.cache_data.clear()
         st.rerun()
-with col_left:
-    st.caption(f"Next auto-refresh in {refresh_rate}s. Tip: set to 10s during live games.")
+with c1:
+    st.caption("Auto-refresh in " + str(refresh_rate) + "s")
 
 time.sleep(refresh_rate)
 st.cache_data.clear()
