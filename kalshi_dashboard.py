@@ -88,6 +88,11 @@ def fetch_espn_games():
                 score = None
             teams[norm] = {"display_name": raw_name, "seed": seed, "score": score}
 
+        try:
+            espn_sort_ts = datetime.fromisoformat(start_str.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            espn_sort_ts = None
+
         game_info = {
             "tipoff":        tipoff,
             "status_state":  status_state,
@@ -95,6 +100,7 @@ def fetch_espn_games():
             "display_clock": display_clock,
             "period":        period,
             "teams":         teams,
+            "sort_ts":       espn_sort_ts,
         }
         for norm_name in teams:
             by_team[norm_name] = game_info
@@ -748,11 +754,12 @@ if markets:
         # ESPN enrichment
         fav_game, fav_team_data = espn_lookup(espn_by_team, fav_name)
         dog_game, dog_team_data = espn_lookup(espn_by_team, dog_name)
-        espn_game  = fav_game or dog_game
-        fav_seed   = fav_team_data["seed"] if fav_team_data else None
-        dog_seed   = dog_team_data["seed"] if dog_team_data else None
-        score_line = format_score_line(espn_game, fav_name, dog_name)
-        espn_state = espn_game["status_state"] if espn_game else None
+        espn_game   = fav_game or dog_game
+        fav_seed    = fav_team_data["seed"] if fav_team_data else None
+        dog_seed    = dog_team_data["seed"] if dog_team_data else None
+        score_line  = format_score_line(espn_game, fav_name, dog_name)
+        espn_state  = espn_game["status_state"] if espn_game else None
+        espn_sort_ts = espn_game["sort_ts"] if espn_game else None
 
         a = analyze_game(fav_mid, dog_mid, spread, total_vol, fav_name, dog_name)
         analyses.append({
@@ -773,7 +780,8 @@ if markets:
             "fav_seed":     fav_seed,
             "dog_seed":     dog_seed,
             "score_line":   score_line,
-            "espn_state":   espn_state,
+            "espn_state":    espn_state,
+            "espn_sort_ts":  espn_sort_ts,
         })
 
     def verdict_priority(g):
@@ -821,7 +829,7 @@ if markets:
     if sort_choice == "Smart":
         shown.sort(key=lambda g: g["_priority"])
     elif sort_choice == "Start time":
-        shown.sort(key=lambda g: g["close_ts"] or float("inf"))
+        shown.sort(key=lambda g: g["espn_sort_ts"] or g["close_ts"] or float("inf"))
     elif sort_choice == "Dog edge ↓":
         shown.sort(key=lambda g: -g["a"].get("edge_dog_cents", 0))
     elif sort_choice == "Volume ↓":
@@ -931,6 +939,7 @@ if markets:
             + '</div>'
             + '<div class="mkt-strip">'
             + time_html
+            + '<span class="mkt-item" style="color:#444;">|</span>'
             + '<span class="mkt-item"><span>' + ql + '</span></span>'
             + '<span class="mkt-item">' + spread_str + '</span>'
             + '<span class="mkt-item">' + vig_str + '</span>'
