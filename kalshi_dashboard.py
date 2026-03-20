@@ -8,15 +8,6 @@ from collections import defaultdict
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 ESPN_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard"
 
-# Historical NCAA Tournament upset rates by seed matchup (1985-2024)
-SEED_UPSET_RATES = {
-    (1, 16): 2,  (2, 15): 6,  (3, 14): 7,  (4, 13): 21,
-    (5, 12): 35, (6, 11): 37, (7, 10): 39, (8,  9): 48,
-    (1,  8): 21, (1,  9): 17, (2,  7): 27, (2, 10): 22,
-    (3,  6): 34, (3, 11): 28, (4,  5): 43,
-    (1,  4): 30, (1,  5): 25, (1,  3): 28,
-    (2,  3): 42, (1,  2): 38,
-}
 
 # Known name mismatches between ESPN and Kalshi/common usage
 TEAM_NAME_ALIASES = {
@@ -97,7 +88,7 @@ def value_target(kalshi_mid, min_edge_pct=2.0):
 
 def _filter_and_sort(markets):
     """Only return open markets. Require explicit open status."""
-    return [m for m in markets if (m.get("status") or "").lower() == "open"]
+    return [m for m in markets if (m.get("status") or "").lower() in ("open", "active")]
 
 # ── ESPN data layer ────────────────────────────────────────────────────────
 
@@ -414,14 +405,13 @@ def market_quality(spread, volume):
 # ── Core analysis engine ──────────────────────────────────────────────────
 
 def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name,
-                 bankroll, kelly_mult, fav_seed, dog_seed):
+                 bankroll, kelly_mult):
     result = {
         "verdict": "— NO DATA", "color": "#555",
         "detail": "", "action_line": "No action.",
         "fav_target": "N/A", "dog_target": "N/A",
         "kelly_fav_dollars": 0, "kelly_dog_dollars": 0,
         "edge_fav_cents": 0,    "edge_dog_cents": 0,
-        "seed_note": None,
     }
 
     q_label, q_icon, q_score = market_quality(spread, volume)
@@ -452,22 +442,6 @@ def analyze_game(fav_mid, dog_mid, spread, volume, fav_name, dog_name,
     k_dog = kelly_fraction(dog_mid, retail_dog_implied) * kelly_mult
     result["kelly_fav_dollars"] = bankroll * min(k_fav, 0.25)
     result["kelly_dog_dollars"] = bankroll * min(k_dog, 0.25)
-
-    # Seed context — now from ESPN, not manual entry
-    if fav_seed and dog_seed:
-        key  = (min(fav_seed, dog_seed), max(fav_seed, dog_seed))
-        hist = SEED_UPSET_RATES.get(key)
-        if hist:
-            note = ("Since 1985: #" + str(dog_seed) + " seeds beat #" + str(fav_seed)
-                    + " seeds " + str(hist) + "% of the time. Kalshi has this dog at "
-                    + str(int(dog_mid)) + "%.")
-            if dog_mid < hist - 5:
-                note += (" Kalshi is " + str(int(hist - dog_mid))
-                         + " cents BELOW historical rate — market might be underpricing the upset.")
-            elif dog_mid > hist + 5:
-                note += (" Market is " + str(int(dog_mid - hist))
-                         + " cents ABOVE historical rate — this specific dog may be stronger than typical.")
-            result["seed_note"] = note
 
     # Verdict logic
     if q_label in ("DEAD", "WIDE"):
@@ -773,7 +747,6 @@ if markets:
         a = analyze_game(
             fav_mid, dog_mid, spread, total_vol,
             fav_name, dog_name, bankroll, kelly_mult,
-            fav_seed, dog_seed,
         )
 
         analyses.append({
@@ -842,10 +815,6 @@ if markets:
             css_class = "score-bar" if g["espn_state"] == "in" else "tipoff"
             score_html = '<div class="' + css_class + '">' + g["score_line"] + '</div>'
 
-        seed_html = ""
-        if a.get("seed_note"):
-            seed_html = '<div style="font-size:0.82em;color:#aaa;padding:4px 0;">' + a["seed_note"] + '</div>'
-
         spread_str = str(round(g["spread"], 1)) + " cents" if g["spread"] else "n/a"
         vig_str    = str(round(g["fav_m"].get("vig", 0), 1)) + " cents" if g["fav_m"].get("vig") else "n/a"
         vol_str    = "{:,.0f}".format(g["vol"])
@@ -887,8 +856,6 @@ if markets:
             + 'Vig: '    + vig_str    + '<br>'
             + 'Vol: '    + vol_str
             + '</div></div></div>'
-
-            + seed_html
 
             + '<div style="margin-bottom:8px;">'
             + '<span class="kb">Kelly ' + g["fav_name"] + ': $' + str(int(a["kelly_fav_dollars"])) + '</span>'
